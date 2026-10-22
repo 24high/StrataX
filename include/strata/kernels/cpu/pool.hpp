@@ -37,7 +37,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -329,5 +331,15 @@ private:
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;
 };
+
+/// The expert whitelist generator's similarity data (docs/EXPERT_WHITELIST.md 7.3): EVERY expert of one layer on `n`
+/// rows of expert input (`x`: n x H floats), with run_split_multi / run_split_multi_native as the verify window calls
+/// them - each row quantized as it quantizes a token, the rows in groups of MAXT, the experts in groups of
+/// kMaxSplitMulti (so a staged expert source's buffers hold while a group runs).  `fmt` is the layer's native format,
+/// or null for the canonical Q2_0 pack; `blob(e)` is expert e's blob (null: false, and `err` names the expert).  `y` is
+/// [row][expert][H]: each expert's own output, without a router weight (the CPU never applies one).
+bool all_expert_outputs(ExpertPool& pool, const NativeFmt* fmt, int64_t n_expert,
+                        const std::function<const uint8_t*(int64_t expert)>& blob, const float* x, int64_t n, float* y,
+                        std::string& err);
 
 }  // namespace strata::kernels::cpu

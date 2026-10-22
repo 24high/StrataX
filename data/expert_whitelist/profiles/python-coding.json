@@ -1,0 +1,59 @@
+{
+  "format_version": 1,
+  "kind": "strata-whitelist-profile",
+  "name": "python-coding",
+  "description": "Python coding for a real collection run: code generation, debugging and tracebacks, refactoring and review, tests and packaging, data work and agent sessions with tool calls, in English and German. docs/EXPERT_WHITELIST.md section 4.1.",
+  "target_languages": {
+    "python": {
+      "weight": 1.0,
+      "min_coverage": 0.95,
+      "calibration": [
+        "../calibration/python/codegen_scripts.jsonl",
+        "../calibration/python/codegen_apps.jsonl",
+        "../calibration/python/data.jsonl",
+        "../calibration/python/debugging.jsonl",
+        "../calibration/python/refactoring_review.jsonl",
+        "../calibration/python/testing_packaging.jsonl",
+        "../calibration/python/agent_sessions.jsonl",
+        "../calibration/python/german.jsonl"
+      ],
+      "sources": [
+        "strata_control/**/*.py",
+        "strata_cli/**/*.py",
+        "serve/*.py",
+        "packaging/*.py",
+        "tools/*.py"
+      ]
+    }
+  },
+  "tasks": {
+    "codegen": 1.0,
+    "debugging": 1.0,
+    "tracebacks": 0.9,
+    "tool_use": 0.9,
+    "refactoring": 0.8,
+    "testing": 0.8,
+    "code_review": 0.7,
+    "data": 0.7,
+    "packaging": 0.6,
+    "source": 0.4
+  },
+  "base_requirements": {
+    "enabled": true,
+    "natural_languages": ["en", "de"],
+    "items": {
+      "instructions": {"calibration": ["../calibration/base/instructions_en.jsonl", "../calibration/base/instructions_de.jsonl"], "min_coverage": 0.90},
+      "chat_template": {"calibration": ["../calibration/base/chat_template.jsonl"], "min_coverage": 0.99},
+      "tool_calls": {"calibration": ["../calibration/base/tool_calls.jsonl"], "min_coverage": 0.95},
+      "shell_build": {"calibration": ["../calibration/base/shell_build.jsonl"], "min_coverage": 0.90}
+    }
+  },
+  "excluded": {
+    "other_code": {"calibration": ["../calibration/contrast/other_code.jsonl"]},
+    "prose": {"calibration": ["../calibration/contrast/prose.jsonl"]},
+    "foreign": {"calibration": ["../calibration/contrast/foreign.jsonl"]}
+  },
+  "target_hardware": {"vram_gib": 16, "ram_gib": 64, "reserve_gib": 8},
+  "limits": {"max_samples": 2000, "max_tokens_per_sample": 4096, "seed": 1},
+  "chat_template": "model"
+}

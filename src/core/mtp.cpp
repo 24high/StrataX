@@ -1,5 +1,6 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
+#include "strata/core/expert_whitelist.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -27,6 +28,7 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/router_top10.hpp"
+#include "strata/kernels/expert_whitelist.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/shared_expert.hpp"
@@ -272,6 +274,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         }
         dense_ = shared->dense_;
         experts_ = shared->experts_;
+        compact_experts_ = shared->compact_experts_;
         tensors_ = shared->tensors_;
         owns_weights_ = false;
         owns_draft_head_ = false;
@@ -308,7 +311,52 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         if (q4_ && !make_q4_dense(blob, err)) return false;
     }
     // ---- the 512 routed experts, one blob each
-    if (shared == nullptr) {
+    // --draft-expert-whitelist: only the draft whitelist's experts, read by offset (neighbours in one read) into a
+    // compact store; the slot map (ExpertSlotMap, layer 0) says where each one is.  Nothing else is read.
+    const strata::core::ExpertWhitelist* dwl = strata::core::active_draft_whitelist();
+    if (shared == nullptr && dwl != nullptr) {
+        strata::core::CompactExpertPlan plan;
+        if (dwl->n_layers != 1 || dwl->experts_per_layer[0] != (int32_t) g.n_expert) {
+            err = "mtp: the draft expert whitelist must describe one layer of " + std::to_string(g.n_expert) + " experts";
+            return false;
+        }
+        if (!strata::core::plan_compact_experts(*dwl, {0}, {(uint64_t) strata::kernels::cpu::BLOB}, false, plan, err)) {
+            err = "mtp: " + err;
+            return false;
+        }
+        FILE* f = std::fopen((rt_dir + "/experts.bin").c_str(), "rb");
+        if (f == nullptr) { err = "mtp: cannot open experts.bin"; return false; }
+        struct Closer {
+            FILE* f;
+            ~Closer() { if (f != nullptr) std::fclose(f); }
+        } closer{f};
+        if (cudaMalloc((void**) &experts_, plan.total) != cudaSuccess) { err = "mtp: the whitelisted experts do not fit in VRAM"; return false; }
+        // `dst` is the device store: each run is read through a 64 MiB host chunk
+        struct DeviceReader : strata::core::BlobReader {
+            FILE* f;
+            std::vector<uint8_t> chunk = std::vector<uint8_t>(64u << 20);
+            explicit DeviceReader(FILE* file) : f(file) {}
+            bool read(uint64_t off, uint64_t n, uint8_t* dst) override {
+#if defined(_WIN32)
+                if (_fseeki64(f, (long long) off, SEEK_SET) != 0) return false;
+#else
+                if (fseeko(f, (off_t) off, SEEK_SET) != 0) return false;
+#endif
+                for (uint64_t done = 0; done < n;) {
+                    const uint64_t m = std::min<uint64_t>(chunk.size(), n - done);
+                    if (std::fread(chunk.data(), 1, (size_t) m, f) != (size_t) m) return false;
+                    if (cudaMemcpy(dst + done, chunk.data(), (size_t) m, cudaMemcpyHostToDevice) != cudaSuccess) return false;
+                    done += m;
+                }
+                return true;
+            }
+        } reader(f);
+        if (!strata::core::load_compact_experts(plan, reader, experts_, err)) { err = "mtp: experts.bin: " + err; return false; }
+        compact_experts_ = true;
+        vram_ += plan.total;
+        std::fprintf(stderr, "strata mtp: draft expert whitelist: %lld of %lld experts loaded (%.1f MiB)\n",
+                     (long long) plan.map.slots(), (long long) g.n_expert, (double) plan.total / 1048576.0);
+    } else if (shared == nullptr) {
         const uint64_t bytes = (uint64_t) g.n_expert * strata::kernels::cpu::BLOB;
         // Loader fix (0.1.15+loaderfix.2): each 64 MiB read below reached the disk as ~16k 4095-byte reads under
         // MSVC's `basic_filebuf::xsgetn`, which is what made 675 MiB of drafter experts take minutes.
@@ -407,6 +455,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             if (gr_mem != nullptr) strata::kernels::gr_workspace_init(gsh, gr_mem, own_gr_);
         }
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
+        slot_ids_ = b.take<int32_t>(T * K);
         grp_ptr_ = b.take<unsigned long long>(T * K); grp_start_ = b.take<int32_t>(T * K + 1);
         grp_counts_ = b.take<int32_t>(4);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
@@ -1108,12 +1157,15 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         }
         // #783 PR-c (stuchapin909): a multi-token window routes in two launches (one router GEMV reading the weight once,
         // one top-10 over all rows - each row bitwise the single-token call) and combines in one
+        // --draft-expert-whitelist (kWlDraft, its one layer 0): the mask before each top-k, the fix after the last pass
         if (T > 1 && native_router_enabled() && g.n_expert == 512 && K == 10) {
             bf16_gemv_fp32_mmvf_multi(mixed_, N, bf16("mlp.gate.weight"), logits_, g.n_expert, (int) N, (int) g.n_expert, T, cs);
+            whitelist_route_mask(kWlDraft, 0, logits_, T, (int) g.n_expert, cs);
             native_router_top10_multi(logits_, ids_, w_, T, cs);
         } else {
         for (int t = 0; t < T; ++t) {
             bf16_gemv_fp32_mmvf(mixed_ + t * N, bf16("mlp.gate.weight"), logits_ + t * g.n_expert, (int) N, (int) g.n_expert, cs);
+            whitelist_route_mask(kWlDraft, 0, logits_ + t * g.n_expert, 1, (int) g.n_expert, cs);
             if (native_router_enabled() && g.n_expert == 512 && K == 10) native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }
@@ -1123,8 +1175,15 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
                 native_route_resident(logits_, ids_, w_, rr_res_, T, rr_margin_, rr_lo_, rr_hi_, nullptr, cs);
             } catch (const std::exception& e) { err = std::string("mtp route-resident: ") + e.what(); return false; }
         }
+        whitelist_route_fix(kWlDraft, 0, logits_, ids_, w_, T, (int) K, (int) g.n_expert, cs);
         g_mp.stamp(9, cs);
-        moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
+        // a compact store is addressed by slot: the ids go through the slot map first (the combine reads w_ by rank)
+        const int32_t* group_ids = ids_;
+        if (compact_experts_) {
+            whitelist_ids_to_slots(kWlDraft, 0, ids_, slot_ids_, (int) (T * K), cs);
+            group_ids = slot_ids_;
+        }
+        moe_group_resident(group_ids, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
                            grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
         quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
         moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,

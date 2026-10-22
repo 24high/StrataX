@@ -1,0 +1,2 @@
+{"prompt": "<|im_start|>system\nYou are a coding assistant.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n", "task": "chat_format"}
+{"prompt": "<|im_start|>user\nContinue the previous answer.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", "task": "chat_format"}

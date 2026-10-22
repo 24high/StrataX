@@ -1,0 +1,3 @@
+{"prompt": "Erkläre in zwei kurzen Sätzen, was dieser Code macht, für Einsteiger.", "task": "explanation", "language": "de"}
+{"prompt": "Fasse die Änderungen in diesem Diff als Commit-Nachricht zusammen, höchstens 72 Zeichen pro Zeile.", "task": "explanation", "language": "de"}
+{"prompt": "Welche Vor- und Nachteile haben die beiden Ansätze? Bitte in einfachen Worten.", "task": "explanation", "language": "de"}

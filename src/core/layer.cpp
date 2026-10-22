@@ -15,6 +15,7 @@
 #include "strata/kernels/fuse_decode.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/router_top10.hpp"
+#include "strata/kernels/expert_whitelist.hpp"
 #include "strata/kernels/s2_gemv_q8.hpp"
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/shared_expert.hpp"
@@ -415,12 +416,16 @@ if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
 //      `bf16_gemv_split` exists for precisely this case; its own header says so.  Measured here:
 //      LEDGER L41 -> L42.
 project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
+// --expert-whitelist (docs/EXPERT_WHITELIST.md): blocked experts' logits to -inf before the top-k, the fix after it;
+// both launch nothing without a whitelist, so the captured graph is the one it always was
+whitelist_route_mask(kWlMain, layer, b.logits, 1, (int) g.n_expert, stream);
 // ---- routing: softmax over ALL experts, stable descending argsort with ties by index, gather, renormalise
 // the native fused router is canonical-512x10 only; anything else takes the generic top-k kernel
 if (native_router_enabled() && g.n_expert == 512 && k == 10) {
     try { native_router_top10(b.logits, b.ids, b.weights, stream); }
     catch (const std::exception& error) { err = v.name("router") + ": " + error.what(); return false; }
 } else router_top10(b.logits, 1, (int) g.n_expert, (int) k, b.ids, b.weights, stream);
+whitelist_route_fix(kWlMain, layer, b.logits, b.ids, b.weights, 1, (int) k, (int) g.n_expert, stream);
 // ---- THE DOORBELL, AND IT IS THE WHOLE POINT OF THE PROTOCOL.  The routed experts' INPUT (`x`) and the
 //      miss list (`ids`, `weights`) are published to the host HERE, before anything that depends on them,
 //      so a CPU pool can start on them while the GPU keeps working.  Both the copy and the ring are
@@ -462,7 +467,9 @@ bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t
                                 g.n_expert, stream);
     else
         bf16_gemv_fp32_mmvf_cols(x, (const uint16_t*) w_router->data, logits, g.n_embd, g.n_expert, n, stream);
+    whitelist_route_mask(kWlMain, layer, logits, n, (int) g.n_expert, stream);   // --expert-whitelist, as moe_route
     router_top10(logits, n, (int) g.n_expert, (int) k, ids, weights, stream);
+    whitelist_route_fix(kWlMain, layer, logits, ids, weights, n, (int) k, (int) g.n_expert, stream);
     return true;
 }
 bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const MoEBuffers& b,                const float* x, void* stream, std::string& err) {    using namespace strata::kernels;    const LayerView v(tables, layer);    const WeightRef* w_ginp = v.get("ffn_gate_inp_shexp.weight");    const WeightRef* w_sgate = v.get("ffn_gate_shexp.weight");    const WeightRef* w_sup = v.get("ffn_up_shexp.weight");    const WeightRef* w_sdown = v.get("ffn_down_shexp.weight");    const char* missing = !w_ginp ? "ffn_gate_inp_shexp.weight" : !w_sgate ? "ffn_gate_shexp.weight"                          : !w_sup ? "ffn_up_shexp.weight" : !w_sdown ? "ffn_down_shexp.weight" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }

@@ -201,6 +201,22 @@ public:
     /// 149-prefetch (STRATA_RAM_ADAPT2): a layer's routed expert ids (T x k, -1 = none) after the prompt path downloaded them
     /// for its grouping on the host; a policy may count them. Not called on the paths that keep the ids on the GPU.
     std::function<void(int64_t layer, const int32_t* ids, int64_t n)> on_routes;
+    /// --routing-stats (docs/EXPERT_WHITELIST.md section 7, opt-in): every MoE layer's final routing of a chunk - the ids
+    /// and weights (T x k, rank order) of positions [pos0, pos0 + T), after the whitelist's fix - downloaded and handed
+    /// here.  Null (the default): nothing is downloaded and nothing waits.
+    std::function<void(int64_t layer, int64_t pos0, int64_t T, const int32_t* ids, const float* w)> on_routing;
+    /// --routing-stats-similarity (docs/EXPERT_WHITELIST.md 7.3, opt-in), right after `on_routing`: the rows of the chunk
+    /// (0 .. T-1, ascending) whose expert input the collector wants (`moe_rows_wanted` fills them); those rows of the
+    /// layer's expert input - n x n_embd floats, what the router and the experts read - are downloaded and handed to
+    /// `on_moe_rows`.  Null (the default) or no row wanted: nothing is downloaded.
+    std::function<void(int64_t layer, int64_t pos0, int64_t T, std::vector<int32_t>& rows)> moe_rows_wanted;
+    std::function<void(int64_t layer, int64_t pos0, const int32_t* rows, int64_t n, const float* x)> on_moe_rows;
+    /// Layer-wise calibration (docs/EXPERT_WHITELIST.md 7.4, opt-in): layer `layer` alone over one sequence at positions
+    /// [0, n).  Its input rows (n x hc*n_embd floats, host) are `rows_in` - null for layer 0, which embeds `tokens` - and
+    /// its output rows go to `rows_out` (host); no head, no on_chunk.  The session state must be zero (session_zero)
+    /// before each sequence.  Only on a prompt path that runs the whole model on one GPU (no layer split, no helper, no
+    /// peer GPU).
+    bool run_layer(int64_t layer, const int64_t* tokens, int64_t n, const float* rows_in, float* rows_out, std::string& err);
     int64_t stopped_at() const { return stopped_at_; }
     /// Grows this stage's (and the later stages') pinned upload slots to what a text chunk of `T` tokens uploads, so
     /// a run of such chunks allocates no pinned memory (STRATA_PIPED_CONCURRENT: an allocation or free on the read's
@@ -265,6 +281,7 @@ private:
     bool force_single_ = false, force_planned_ = false;
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+    float* rows_out_ = nullptr;         ///< run_layer: where the layer's output rows go (host); null otherwise
     /// STRATA_HANDOFF_PIPE: the previous stage's per-piece "landed in hand_in_" events (cudaEvent_t[hand_pieces_],
     /// on its device) when it copies the chunk in pieces without a host wait; null with the one-copy hand-off
     const void* hand_ev_ = nullptr;

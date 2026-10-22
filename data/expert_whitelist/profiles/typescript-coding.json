@@ -1,0 +1,18 @@
+{
+  "format_version": 1,
+  "kind": "strata-whitelist-profile",
+  "name": "typescript-coding",
+  "description": "TypeScript coding, weighted below Rust when the two are combined (--profile rust-coding.json --profile typescript-coding.json).",
+  "target_languages": {
+    "typescript": {
+      "weight": 0.5,
+      "min_coverage": 0.90,
+      "calibration": ["../calibration/typescript.jsonl"],
+      "sources": []
+    }
+  },
+  "tasks": {"codegen": 1.0, "compiler_errors": 0.8, "refactoring": 0.6},
+  "base_requirements": {"enabled": false},
+  "target_hardware": {"vram_gib": 16, "ram_gib": 64, "reserve_gib": 8},
+  "limits": {"max_samples": 1000, "max_tokens_per_sample": 2048, "seed": 1}
+}

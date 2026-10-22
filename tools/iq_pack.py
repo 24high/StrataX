@@ -32,6 +32,10 @@ v4, so an older engine refuses it instead of misreading it.  Every other pack st
 tensors stored as F32 whose values are exactly BF16 (Swift 1.5) are written as BF16, the form the engine's router
 takes (so are the other F32 tensors the engine reads as BF16, when exact); anything else is refused.
 
+    python tools/iq_pack.py index PACK [--check]   the expert index sidecar of an existing pack (experts.index.json:
+                   where each layer's experts start and the bytes of one; --expert-whitelist checks it), nothing else
+                   in the pack is changed
+
 For ordinary quants, --compat-bf16 dequantizes the small projections that the engine reads as BF16, using
 round-to-nearest-even. This introduces BF16 rounding; it does not reconstruct the original full-precision
 weights. Experts, native attention projections, token embeddings, a Q2_0/Q8_0 PLE key and the disk-backed PLE
@@ -48,6 +52,14 @@ import re
 import shutil
 import subprocess
 import sys
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "index":
+    # `iq_pack.py index PACK [--check]`: the expert index sidecar (experts.index.json) of an existing pack, for
+    # --expert-whitelist (docs/EXPERT_WHITELIST.md).  Reads the pack's layout files, writes that one file beside them and
+    # changes nothing else; needs no numpy, so it runs before the packer's imports.
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import expert_whitelist  # noqa: E402
+    sys.exit(expert_whitelist.main(sys.argv[1:]))
 
 import numpy as np
 

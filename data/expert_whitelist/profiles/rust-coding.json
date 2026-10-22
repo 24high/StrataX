@@ -1,0 +1,40 @@
+{
+  "format_version": 1,
+  "kind": "strata-whitelist-profile",
+  "name": "rust-coding",
+  "description": "Rust coding: code generation, compiler errors, debugging and refactoring, with English and German instructions.",
+  "target_languages": {
+    "rust": {
+      "weight": 1.0,
+      "min_coverage": 0.95,
+      "calibration": ["../calibration/rust.jsonl"],
+      "sources": []
+    }
+  },
+  "tasks": {
+    "codegen": 1.0,
+    "compiler_errors": 0.9,
+    "debugging": 0.8,
+    "refactoring": 0.6,
+    "repo_analysis": 0.5,
+    "tool_use": 0.7
+  },
+  "base_requirements": {
+    "enabled": true,
+    "natural_languages": ["en", "de"],
+    "items": {
+      "instructions": {"calibration": ["../calibration/base_instructions_en.jsonl", "../calibration/base_instructions_de.jsonl"], "min_coverage": 0.90},
+      "chat_template": {"calibration": ["../calibration/base_chat_template.jsonl"], "min_coverage": 0.99},
+      "tool_calls": {"calibration": ["../calibration/base_tool_calls.jsonl"], "min_coverage": 0.95},
+      "shell_build": {"calibration": ["../calibration/base_shell_build.jsonl"], "min_coverage": 0.90}
+    }
+  },
+  "excluded": {
+    "python": {"calibration": ["../calibration/python.jsonl"]},
+    "prose": {"calibration": ["../calibration/excluded_prose.jsonl"]},
+    "french": {"calibration": ["../calibration/excluded_french.jsonl"]}
+  },
+  "target_hardware": {"vram_gib": 16, "ram_gib": 64, "reserve_gib": 8},
+  "limits": {"max_samples": 2000, "max_tokens_per_sample": 2048, "seed": 1},
+  "chat_template": "model"
+}

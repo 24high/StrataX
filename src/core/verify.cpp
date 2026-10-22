@@ -33,6 +33,7 @@
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/route_prior.hpp"
+#include "strata/kernels/expert_whitelist.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -1863,6 +1864,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!sg_ready)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
+                strata::kernels::whitelist_route_mask(strata::kernels::kWlMain, l, logits_ + tb * NE, n, (int) NE, cs);   // --expert-whitelist
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
@@ -1893,6 +1895,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
+        // --expert-whitelist: after every pass that picks ids (the router, STRATA_ROUTE_PRIOR, STRATA_ROUTE_RESIDENT) and
+        // before anything reads them (the plan, the doorbell); a no-op on rows moe_route already fixed
+        strata::kernels::whitelist_route_fix(strata::kernels::kWlMain, l, logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n,
+                                             (int) K, (int) NE, cs);
         if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,

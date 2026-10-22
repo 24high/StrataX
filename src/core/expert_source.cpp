@@ -1,5 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/core/expert_whitelist.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/platform/aux_cpus.hpp"
@@ -68,6 +69,22 @@
 #endif
 
 namespace strata::core {
+
+namespace {
+/// --expert-whitelist (docs/EXPERT_WHITELIST.md): a request for an expert the whitelist does not let be loaded is
+/// refused, and the first one is latched with its layer and expert (`whitelist_violation`) - never read, never a
+/// silent fallback.  No whitelist: always true (one atomic load).
+inline bool wl_loadable(int64_t layer, int64_t expert, const char* where) {
+    const ExpertWhitelist* wl = active_expert_whitelist();
+    return wl == nullptr || wl->loadable(layer, expert) || whitelist_note_violation(layer, expert, where);
+}
+inline bool wl_loadable_all(int64_t layer, const int64_t* experts, int64_t n, const char* where) {
+    if (active_expert_whitelist() == nullptr) return true;
+    for (int64_t i = 0; i < n; ++i)
+        if (!wl_loadable(layer, experts[i], where)) return false;
+    return true;
+}
+}  // namespace
 
 namespace detail {
 
@@ -187,11 +204,15 @@ bool make_cache_complement_plan(
     }
 
     offsets.assign(count, kNoCacheComplement);
+    // --expert-whitelist: only its resident tier has a place in the copy; the rest keep the mapped-file entry, which
+    // the source refuses to read (wl_loadable) for a blocked expert and reads on demand for the tiered mode's second tier
+    const ExpertWhitelist* const wl = active_expert_whitelist();
     for (int64_t layer = 0; layer < n_layers; ++layer) {
         const uint64_t blob_bytes = layer_blob_bytes[(size_t) layer];
         for (int64_t expert = 0; expert < n_expert; ++expert) {
             const size_t index = (size_t) layer * (size_t) n_expert + (size_t) expert;
             if (omitted[index] != 0) continue;
+            if (wl != nullptr && !wl->resident(layer, expert)) continue;
             if (bytes > std::numeric_limits<uint64_t>::max() - blob_bytes) {
                 offsets.clear();
                 bytes = 0;
@@ -848,6 +869,7 @@ void FileExpertSource::io_window_tick() {
 void FileExpertSource::warm_scored(int64_t layer, const int64_t* experts, const float* conf, int64_t n, int ahead) {
     if (!io_sched_ || !io_pf_ || !direct_.empty() || !io_ahead_ || !gate_open()) { warm(layer, experts, n); return; }
     if (n <= 0 || layer < 0 || layer >= n_layers_) return;
+    if (!wl_loadable_all(layer, experts, n, "the read-ahead (warm_scored)")) return;
     const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
     const uint64_t deadline = io_epoch_.load(std::memory_order_relaxed) + (uint64_t) std::max(1, ahead);
     bool any = false;
@@ -1859,6 +1881,7 @@ const uint8_t* FileExpertSource::staged_blob(int64_t layer, int64_t expert) {
 
 void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n) {
     if (!staged() || n <= 0 || layer < 0 || layer >= n_layers_) return;
+    if (!wl_loadable_all(layer, experts, n, "the expert source (prefetch)")) return;
     if (io_fill_ && io_pf_ && direct_.empty()) {   // hand the layer's uncached blobs to the workers and go on: the kernels
         for (int64_t i = 0; i < n; ++i) {          // that reach one before it lands wait on its pages, the rest compute
             const int64_t e = experts[i];
@@ -1958,6 +1981,7 @@ void FileExpertSource::claim_todo(int64_t layer, const int64_t* experts, int64_t
 int64_t FileExpertSource::prefetch_begin(int64_t layer, const int64_t* experts, int64_t n, uint8_t* pending) {
     for (int64_t i = 0; i < n; ++i) pending[i] = 0;
     if (!staged() || n <= 0 || layer < 0 || layer >= n_layers_) return 0;
+    if (!wl_loadable_all(layer, experts, n, "the expert source (prefetch_begin)")) return 0;
     if (io_fill_ && io_pf_ && direct_.empty()) {   // the page-fill mode: nothing is staged here, the kernels wait on pages
         prefetch(layer, experts, n);
         return 0;
@@ -2039,6 +2063,7 @@ int64_t FileExpertSource::wait_landed(int64_t layer, const int64_t* experts, int
 }
 
 bool FileExpertSource::zc_roles(int64_t layer, int64_t expert, const uint8_t** p) {
+    if (!wl_loadable(layer, expert, "the expert source (zero-copy)")) return false;
     const int64_t key = layer * n_expert_ + expert;
     if (std::find(zc_keys_.begin(), zc_keys_.end(), key) == zc_keys_.end()) return false;
     for (int r = 0; r < 3; ++r) {
@@ -2067,6 +2092,8 @@ void FileExpertSource::prefetch_end() {
 
 void FileExpertSource::prefetch_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) {
     if (direct_.empty() || pairs == nullptr || n <= 0) return;   // unbuffered only: the mapped fill stays as it was
+    for (int64_t i = 0; i < n; ++i)
+        if (!wl_loadable(pairs[i].first, pairs[i].second, "the expert source (prefetch_pairs)")) return;
     std::vector<Fill> todo;
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -2083,6 +2110,8 @@ void FileExpertSource::prefetch_pairs(const std::pair<int32_t, int32_t>* pairs, 
 
 bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
     if (base_ == nullptr || unmapped_ || !direct_.empty() || !strata::platform::read_ahead_enabled()) return false;
+    for (int64_t i = 0; pairs != nullptr && i < n; ++i)
+        if (!wl_loadable(pairs[i].first, pairs[i].second, "the expert source (advise_pairs)")) return false;
     for (int64_t i = 0; pairs != nullptr && i < n; ++i) {
         const int64_t l = pairs[i].first, e = pairs[i].second;
         if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) continue;
@@ -2721,6 +2750,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 
 void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
     if ((role_ptr_.empty() && !io_pf_) || n <= 0 || layer < 0 || layer >= n_layers_) return;
+    if (!wl_loadable_all(layer, experts, n, "the read-ahead (warm)")) return;
     uint32_t stamp;
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -2974,6 +3004,12 @@ void RouterLookahead::run() {
                 }
             }
         }
+        // --expert-whitelist: the look-ahead predicts only the resident tier, so a blocked expert is never warmed and the
+        // tiered mode's on_demand tier is read only once the router has picked it
+        if (const ExpertWhitelist* wl = active_expert_whitelist(); wl != nullptr)
+            for (int64_t t = 0; t < nt; ++t)
+                for (int64_t e = 0; e < n_expert_; ++e)
+                    if (!wl->resident(layer, e)) logits[(size_t) (t * n_expert_ + e)] = -INFINITY;
         const int kmax = stats_on_ ? (int) std::min<int64_t>(k_ + 10, n_expert_) : k_;
         const int ks[3] = {k_, (int) std::min<int64_t>(k_ + 4, n_expert_), kmax};
         std::vector<uint64_t> sm;
@@ -3041,6 +3077,7 @@ void RouterLookahead::run() {
 void FileExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k) {
     (void) ids;
     (void) k;
+    if (od_cache_ != nullptr) od_cache_->begin_layer(layer);   // --expert-whitelist, tiered: the cache's epoch
     if (!staged()) return;
     bool new_window = false;
     {
@@ -3097,9 +3134,32 @@ double FileExpertSource::cached_share(int64_t samples) const {
 #endif
 }
 
+/// The on_demand cache's reads: the expert's blob from the files, as copy_blob reads it (and counts it), never through
+/// the cache itself.
+struct FileExpertSource::OnDemandFileReader : OnDemandCache::Reader {
+    FileExpertSource* src = nullptr;
+    bool read(int64_t layer, int64_t expert, uint8_t* dst, uint64_t) override { return src->copy_blob_files(layer, expert, dst); }
+};
+
 bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     if (base_ == nullptr || dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
         return false;
+    if (!wl_loadable(layer, expert, "the expert source (copy_blob)")) return false;
+    // --expert-whitelist, tiered: an on_demand expert is copied out of the on_demand cache (read into it on a miss); one
+    // the cache has no room for is read from the files as without it
+    if (od_cache_ != nullptr) {
+        if (const ExpertWhitelist* wl = active_expert_whitelist(); wl != nullptr && wl->on_demand(layer, expert)) {
+            OnDemandFileReader rd;
+            rd.src = this;
+            OnDemandCache::Got got = OnDemandCache::Got::Failed;
+            if (od_cache_->copy(layer, expert, rd, dst, &got)) return true;
+            if (got != OnDemandCache::Got::NoRoom) return false;
+        }
+    }
+    return copy_blob_files(layer, expert, dst);
+}
+
+bool FileExpertSource::copy_blob_files(int64_t layer, int64_t expert, uint8_t* dst) {
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
     if (complement_ready_) {
@@ -3131,6 +3191,13 @@ bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts,
     for (size_t i = 0; i < n; ++i) {
         const int64_t l = layers[i], e = experts[i];
         if (base_ == nullptr || dst[i] == nullptr || l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) return false;
+        if (!wl_loadable(l, e, "the expert source (copy_blobs)")) return false;
+        if (od_cache_ != nullptr) {   // --expert-whitelist, tiered: an on_demand expert through the on_demand cache
+            if (const ExpertWhitelist* wl = active_expert_whitelist(); wl != nullptr && wl->on_demand(l, e)) {
+                if (!copy_blob(l, e, dst[i])) return false;
+                continue;
+            }
+        }
         const size_t index = (size_t) l * (size_t) n_expert_ + (size_t) e;
         if (complement_ready_ &&
             (resident_blob(index) != nullptr || (!override_.empty() && override_[index] != nullptr))) {
@@ -4036,6 +4103,9 @@ bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) 
     if (!complement_ready_ || complement_host_ == nullptr || exchange_storage_.active() || !staged_.empty() ||
         layer < 0 || layer >= n_layers_ || in < 0 || out < 0 || in >= n_expert_ || out >= n_expert_ || in == out)
         return false;
+    // --expert-whitelist: the RAM copy holds the resident tier only
+    if (const ExpertWhitelist* wl = active_expert_whitelist(); wl != nullptr && !wl->resident(layer, in))
+        return whitelist_note_violation(layer, in, "the RAM tier (STRATA_RAM_ADAPT)");
     const size_t i_in = (size_t) layer * (size_t) n_expert_ + (size_t) in;
     const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
     if (i_in >= complement_offsets_.size() || i_out >= complement_offsets_.size()) return false;
@@ -4084,6 +4154,8 @@ bool FileExpertSource::ram_stage(int64_t layer, int64_t in, int64_t out) {
     if (!complement_ready_ || complement_host_ == nullptr || layer < 0 || layer >= n_layers_ || in < 0 || out < 0 ||
         in >= n_expert_ || out >= n_expert_ || in == out)
         return false;
+    if (const ExpertWhitelist* wl = active_expert_whitelist(); wl != nullptr && !wl->resident(layer, in))
+        return whitelist_note_violation(layer, in, "the RAM tier (STRATA_RAM_ADAPT2)");
     {
         std::lock_guard<std::mutex> lk(ram_mu_);
         static const size_t cap = [] {
@@ -4239,6 +4311,7 @@ const uint8_t* FileExpertSource::resident_blob(int64_t layer, int64_t expert) co
 }
 
 const uint8_t* FileExpertSource::blob_stable(int64_t layer, int64_t expert) {
+    if (!wl_loadable(layer, expert, "the expert source (blob_stable)")) return nullptr;
     if (io_pf_ && role_ptr_.empty() && direct_.empty()) {
         if (complement_ready_ && layer >= 0 && expert >= 0 && layer < n_layers_ && expert < n_expert_) {
             const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
@@ -4258,6 +4331,7 @@ int FileExpertSource::blob_parts(int64_t layer, int64_t expert, BlobPart* out) {
     if (role_ptr_.empty() || !direct_.empty() || io_pf_ || unmapped_ || base_ == nullptr || layer < 0 || expert < 0 ||
         layer >= n_layers_ || expert >= n_expert_)
         return 0;
+    if (!wl_loadable(layer, expert, "the expert source (blob_parts)")) return 0;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     if (complement_ready_ && (resident_blob(index) != nullptr || (!override_.empty() && override_[index] != nullptr))) return 0;
     Span sp[3];
@@ -4272,6 +4346,22 @@ int FileExpertSource::blob_parts(int64_t layer, int64_t expert, BlobPart* out) {
 
 const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
     if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
+    if (!wl_loadable(layer, expert, "the expert source")) return nullptr;
+    // --expert-whitelist, tiered: an on_demand expert comes from the on_demand cache and its fixed budget; one the cache
+    // has no room for (every entry still in use) is read from the files below, as without the cache
+    if (od_cache_ != nullptr) {
+        if (const ExpertWhitelist* wl = active_expert_whitelist(); wl != nullptr && wl->on_demand(layer, expert)) {
+            OnDemandFileReader rd;
+            rd.src = this;
+            OnDemandCache::Got got = OnDemandCache::Got::Failed;
+            const uint8_t* b = od_cache_->get(layer, expert, rd, &got);
+            if (b != nullptr) {
+                reads_.fetch_add(1, std::memory_order_relaxed);
+                return b;
+            }
+            if (got != OnDemandCache::Got::NoRoom) return nullptr;
+        }
+    }
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     const uint8_t* result = nullptr;
     bool from_files = true;
@@ -4341,6 +4431,51 @@ bool FileExpertSource::pcie_layer(int64_t layer) const {
 
 // ================================ THE ADAPTER ================================
 
+bool whitelist_on_demand_cached(const ExpertSource* src) {
+    const ExpertWhitelist* wl = active_expert_whitelist();
+    const auto* file = dynamic_cast<const FileExpertSource*>(src);
+    return wl != nullptr && wl->mode == WhitelistMode::Tiered && file != nullptr && file->on_demand_cache() != nullptr;
+}
+
+void whitelist_count_on_demand(ExpertSource* src, int64_t layer, const int32_t* ids, int64_t n, bool cached_reads) {
+    WhitelistStats* ws = whitelist_stats();
+    const ExpertWhitelist* wl = active_expert_whitelist();
+    if (ws == nullptr || wl == nullptr || wl->mode != WhitelistMode::Tiered) return;
+    auto* file = dynamic_cast<FileExpertSource*>(src);
+    if (cached_reads && file != nullptr && file->on_demand_cache() != nullptr) return;   // the cache counts its own reads
+    thread_local std::vector<uint8_t> seen;   // each expert once per call: one read serves every token of a window
+    seen.assign((size_t) strata::kernels::cpu::expert_layout().n_expert, 0);
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t e = ids[i];
+        if (!wl->on_demand(layer, e) || e < 0 || (size_t) e >= seen.size() || seen[(size_t) e]) continue;
+        seen[(size_t) e] = 1;
+        // before anything reads it: in the page cache (tier 1) a hit, else it comes from the drive
+        if (file != nullptr && file->tier_of(layer, e) == 1) ws->on_demand_hit();
+        else ws->on_demand_miss(strata::kernels::cpu::expert_layout().blob_bytes(layer));
+    }
+}
+
+bool expert_outputs_cpu(ExpertSource* src, strata::kernels::cpu::ExpertPool& pool, int64_t layer, const float* x, int64_t n,
+                        int64_t n_embd, float* y, std::string& err) {
+    using namespace strata::kernels::cpu;
+    const ExpertLayout& lay = expert_layout();
+    if (src == nullptr || layer < 0 || layer >= lay.n_layers) {
+        err = "no expert source, or a layer out of range";
+        return false;
+    }
+    if (n_embd != H) {   // the kernels' blob offsets are compiled for this width
+        err = "the CPU expert kernels are compiled for a " + std::to_string(H) + "-wide activation, the model's is " +
+              std::to_string(n_embd);
+        return false;
+    }
+    if (!all_expert_outputs(pool, lay.native ? &lay.fmt[(size_t) layer] : nullptr, lay.n_expert,
+                            [&](int64_t e) { return src->blob(layer, e); }, x, n, y, err)) {
+        err = "layer " + std::to_string(layer) + ": " + err;
+        return false;
+    }
+    return true;
+}
+
 void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
                           int64_t k, float* out) {
     (void) weights;   // clause 2: `moe_combine` applies it on the device.  Not an oversight.
@@ -4365,6 +4500,23 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         return;
     }
     if (k > (int64_t) d.jobs.size()) d.jobs.resize((size_t) k);
+    // --expert-whitelist: every routed id must be routable - a blocked one is a hard error with its layer and expert,
+    // before anything is read for it
+    if (!whitelist_check_ids(d.layers, ids, k, "the decode expert pool")) {
+        static thread_local std::string wl_error;
+        wl_error = whitelist_violation();
+        d.failed = true;
+        d.fail = wl_error.c_str();
+        d.fail_layer = d.layers;
+        if (const ExpertWhitelist* wl = active_expert_whitelist(); wl != nullptr)
+            for (int64_t i = 0; i < k; ++i)
+                if (!wl->routable(d.layers, ids[i])) { d.fail_expert = ids[i]; break; }
+        return;
+    }
+    if (WhitelistStats* ws = whitelist_stats(); ws != nullptr) {   // decode: every routed expert runs (CPU or GPU)
+        for (int64_t i = 0; i < k; ++i) ws->executed(d.layers, ids[i]);
+        whitelist_count_on_demand(d.src, d.layers, ids, k, true);
+    }
 
     d.src->begin_layer(d.layers, ids, k);
 
@@ -4511,6 +4663,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
+    // --expert-whitelist: as the single-token pool, before the look-ahead or anything else reads an expert
+    if (!whitelist_check_ids(d.layers, ids, n_tok * k, "the verify window's expert pool")) {
+        static thread_local std::string wl_error;
+        wl_error = whitelist_violation();
+        d.failed = true;
+        d.fail = wl_error.c_str();
+        d.fail_layer = d.layers;
+        if (const ExpertWhitelist* wl = active_expert_whitelist(); wl != nullptr)
+            for (int64_t i = 0; i < n_tok * k; ++i)
+                if (!wl->routable(d.layers, ids[i])) { d.fail_expert = ids[i]; break; }
+        return;
+    }
+    if (whitelist_stats() != nullptr) whitelist_count_on_demand(d.src, d.layers, ids, n_tok * k, true);
     if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) MAXT);
     const ExpertLayout& lay = expert_layout();
     const bool native = lay.native;
@@ -4533,9 +4698,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     pt("begin");
     d.src->begin_layer(d.layers, ids, n_tok * k);
     pt("begun");
-    if (!d.usage.empty())
+    if (!d.usage.empty()) {
+        // --expert-whitelist, tiered: the on_demand tier is never counted, so no adaptive tier promotes it
+        const ExpertWhitelist* wl = active_expert_whitelist();
         for (int64_t i = 0; i < n_tok * k; ++i)
-            if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
+            if (ids[i] >= 0 && ids[i] < d.n_expert && (wl == nullptr || wl->resident(d.layers, ids[i])))
+                d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
+    }
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
@@ -4703,6 +4872,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // copy_or_zero_from_mapped copies every row, so there the host still zeroes them
     static const bool device_plan = [] { const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN"); return v != nullptr && std::atoi(v) != 0; }();
     const bool gpu_zeroes_hits = (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap && dec_batch && !device_plan);
+    if (WhitelistStats* ws = whitelist_stats(); ws != nullptr)   // --expert-whitelist-stats: every entry that runs
+        for (int64_t i = 0; i < n; ++i)
+            if (kind[i] != -2) ws->executed(d.layers, ids[i]);        // (on the CPU, a GPU, over PCIe; not a skipped tail)
     bool any_cpu = false;
     for (int64_t i = 0; i < n; ++i)
         if (kind[i] == -1) { any_cpu = true; break; }   // -2: skipped (STRATA_ROUTE_TAIL_SKIP), no work
@@ -4946,6 +5118,11 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
             if (e < 0 || e >= d.n_expert) continue;   // out of range: the pool refuses it, with a message
             int32_t slot = d.cache->slot_of(d.layers, e);
             if (slot == kNotResident) {
+                // --expert-whitelist, tiered: the on_demand tier stays outside the VRAM cache (the CPU reads it from the drive)
+                if (const ExpertWhitelist* wl = active_expert_whitelist(); wl != nullptr && !wl->resident(d.layers, e)) {
+                    ++d.cache_refused;
+                    continue;
+                }
                 const int32_t cand = d.cache->admit(d.layers, e);
                 if (cand == kNotResident) {
                     ++d.cache_refused;
@@ -5393,6 +5570,12 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
                              std::string& err, uint64_t max_pinned_bytes,
                              const std::string& shared_arena_file) {
     close();
+    // --expert-whitelist: this arena reads every expert into RAM, which the whitelist forbids; the driver takes the
+    // mapped source with its compact RAM copy instead (generate.cpp), so reaching this is a wiring mistake
+    if (active_expert_whitelist() != nullptr) {
+        err = "ArenaExpertSource: the RAM arena loads every expert and cannot be used with --expert-whitelist";
+        return false;
+    }
     const std::string path = pack_dir + "/experts.bin";
     // plan v0.3 P6: the layout (canonical, or a native pack's per-layer blobs) was loaded by the driver
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();

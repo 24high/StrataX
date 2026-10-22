@@ -285,6 +285,10 @@ private:
     float* attn_scratch_ = nullptr;
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *y_ = nullptr, *sample_ = nullptr;
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr, *out_ids_ = nullptr;
+    /// --draft-expert-whitelist: `experts_` holds only the draft whitelist's experts (the slot map's order) and the
+    /// grouped kernels read the routed ids through `slot_ids_`
+    bool compact_experts_ = false;
+    int32_t* slot_ids_ = nullptr;
     uint8_t* hit_xq_ = nullptr;
     unsigned long long* grp_ptr_ = nullptr;
     int32_t *grp_start_ = nullptr, *grp_counts_ = nullptr;

@@ -1,4 +1,5 @@
 #include "strata/core/remote_experts.hpp"
+#include "strata/core/expert_whitelist.hpp"
 #include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
 #include "strata/core/remote_expert_opt.hpp"
 
@@ -156,8 +157,10 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     std::vector<std::pair<int32_t, int32_t>> selected;
     selected.reserve((size_t) std::min<int64_t>(slots, layers * experts));
     std::vector<uint8_t> picked(claimed.size(), 0);
+    const ExpertWhitelist* const wl = active_expert_whitelist();   // --expert-whitelist: its resident tier only
     for (const auto& pair : ranked) {
         if (pair.first < 0 || pair.first >= layers || pair.second < 0 || pair.second >= experts) continue;
+        if (wl != nullptr && !wl->resident(pair.first, pair.second)) continue;
         const size_t index = (size_t) pair.first * (size_t) experts + (size_t) pair.second;
         if (primary.slot_of(pair.first, pair.second) < 0 && !claimed[index] && !picked[index]) {
             const uint64_t bytes = lay.native ? (lay.blob_bytes(pair.first) + 255) / 256 * 256 : lay.max_blob;

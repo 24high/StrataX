@@ -292,6 +292,25 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_geometry_test tests/core/gguf_geometry_test.cpp)
   target_link_libraries(gguf_geometry_test PRIVATE strata_artifact)
   add_test(NAME gguf_geometry_test COMMAND gguf_geometry_test)
+  # --expert-whitelist on a synthetic mini-MoE: the manifest's checks, the routing filter the kernels run
+  # (whitelist_route.hpp), the slot map and the selective load, through prompt/generation/verify/speculative paths;
+  # the substitute mode's rules and the tiered mode's on_demand cache (budget, counters, threads)
+  find_package(Threads REQUIRED)
+  add_executable(expert_whitelist_test tests/core/expert_whitelist_test.cpp src/core/expert_whitelist.cpp)
+  target_include_directories(expert_whitelist_test PRIVATE include)
+  target_link_libraries(expert_whitelist_test PRIVATE strata_warnings Threads::Threads)
+  add_test(NAME expert_whitelist_test COMMAND expert_whitelist_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/expert_whitelist)
+  # the whitelist generator's statistics collection on a synthetic mini-MoE: exact merges, token mode with resume, the
+  # layer-wise scheduler against the token path (byte for byte), budgets, resume after aborts, the experts' similarity
+  # data; and the fixtures tools/test_whitelist_gen.py reads.  Its paths must compute the same bits: no contracted
+  # multiply-adds.
+  add_executable(routing_stats_test tests/core/routing_stats_test.cpp src/core/routing_stats.cpp
+                                    src/core/layerwise_calib.cpp src/core/expert_whitelist.cpp
+                                    src/core/expert_similarity.cpp)
+  target_include_directories(routing_stats_test PRIVATE include)
+  target_compile_options(routing_stats_test PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-ffp-contract=off>)
+  target_link_libraries(routing_stats_test PRIVATE strata_warnings Threads::Threads)
+  add_test(NAME routing_stats_test COMMAND routing_stats_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/expert_whitelist/stats-mini)
 
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)
@@ -334,7 +353,8 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
-                               src/core/layout.cpp)
+                               src/core/layout.cpp src/core/expert_whitelist.cpp src/core/routing_stats.cpp
+                               src/core/layerwise_calib.cpp src/core/expert_similarity.cpp)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   if(STRATA_ENABLE_CUDA AND STRATA_EXPERIMENTAL_SM60)
     # the runtime device check (src/core/device.cu) admits the cards this build was made for (#236)
@@ -399,6 +419,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/native_gr_postops.cu
                           src/kernels/cuda/native_router.cu
                           src/kernels/cuda/route_prior.cu
+                          src/kernels/cuda/expert_whitelist.cu
                           src/kernels/cuda/native_gdn_preprocess.cu
                           src/kernels/cuda/native_qsa.cu
                           src/kernels/cuda/native_rope.cu
@@ -1617,6 +1638,13 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(pool_tasks_test src/kernels/cpu/pool_tasks_test.cpp)
     target_link_libraries(pool_tasks_test PRIVATE strata_kernels_cpu)
     add_test(NAME pool_tasks_test COMMAND pool_tasks_test)
+    # the expert whitelist's similarity data on the CPU (all_expert_outputs, docs/EXPERT_WHITELIST.md 7.3): every expert
+    # on several rows through the pool against each expert alone, bit for bit (synthetic Q4_0 experts; the canonical
+    # pack's with AVX-512 only)
+    add_executable(all_expert_outputs_test src/kernels/cpu/all_expert_outputs_test.cpp)
+    target_link_libraries(all_expert_outputs_test PRIVATE strata_kernels_cpu)
+    add_test(NAME all_expert_outputs_test COMMAND all_expert_outputs_test)
+    set_tests_properties(all_expert_outputs_test PROPERTIES SKIP_RETURN_CODE 77)   # no AVX: skipped
     set_tests_properties(pool_tasks_test PROPERTIES TIMEOUT 180)
     add_test(NAME router_dot_parity COMMAND router_dot_parity)
     add_test(NAME router_dot_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:router_dot_parity>)

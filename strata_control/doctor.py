@@ -21,6 +21,7 @@ PATH_FLAGS = {
     "--native": "file",
     "--ple-gguf": "file",
     "--expert-profile": "file",
+    "--expert-whitelist": "file",
     "--mtp": "directory",
     "--control-vector-scaled": "file_with_scale",
 }

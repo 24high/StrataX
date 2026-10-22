@@ -52,6 +52,7 @@ namespace strata::core {
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;
 struct LoadStats;
+class OnDemandCache;   // --expert-whitelist, tiered mode: the on_demand tier's cache (expert_whitelist.hpp)
 
 namespace detail {
 
@@ -649,6 +650,24 @@ struct ExpertDispatch {
     int64_t fail_expert = -1;
 };
 
+/// --expert-whitelist-stats, tiered mode: counts each distinct on_demand expert among `ids` once, as a hit when its
+/// pages are in the page cache before it is read (FileExpertSource::tier_of) and as a miss with its bytes otherwise.
+/// Nothing without stats or outside tiered mode.  `cached_reads`: the caller reads the on_demand experts through the
+/// source's on_demand cache when one is attached (the CPU pools' `blob`, the prompt path's copies); that cache then counts
+/// them itself, so nothing is counted here.
+void whitelist_count_on_demand(ExpertSource* src, int64_t layer, const int32_t* ids, int64_t n, bool cached_reads = false);
+
+/// --expert-whitelist, tiered mode: whether `src` serves its on_demand experts from an on_demand cache.  The prompt path
+/// then has the source copy them (copy_blob/copy_blobs, through the cache) instead of taking a pointer.
+bool whitelist_on_demand_cached(const ExpertSource* src);
+
+/// --routing-stats-similarity (docs/EXPERT_WHITELIST.md 7.3): every expert of `layer` on `n` rows of expert input (`x`:
+/// n x n_embd floats) on the CPU, with the verify window's kernels and pool (run_split_multi, _native) - up to MAXT rows
+/// and kMaxSplitMulti experts a batch, so a staged source's buffers hold.  `y` is [row][expert][n_embd], each expert's own
+/// output (the router's weight is never applied on the CPU).  False and `err` when it cannot run.
+bool expert_outputs_cpu(ExpertSource* src, strata::kernels::cpu::ExpertPool& pool, int64_t layer, const float* x, int64_t n,
+                        int64_t n_embd, float* y, std::string& err);
+
 /// `strata::core::PoolFn`, exactly.  Silent on failure BY SIGNATURE - see `ExpertDispatch::fail`.
 void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
                           int64_t k, float* out);
@@ -880,6 +899,14 @@ public:
     bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const override;
 
     const uint8_t* blob(int64_t layer, int64_t expert) override;
+    /// --expert-whitelist, tiered mode: the on_demand tier's cache, with its fixed budget (generate.cpp sets it up).
+    /// `blob` serves an on_demand expert from it (a pointer that holds as the stage buffers' do, `stage_age` layer
+    /// changes); `copy_blob` and `copy_blobs` copy one out of it (the prompt path's stager: the entry is held only while
+    /// it is copied).  A miss is read from the files; one the cache has no room for is read from the files as without
+    /// it.  Null (the default): nothing changes.
+    void set_on_demand_cache(OnDemandCache* c) { od_cache_ = c; }
+    OnDemandCache* on_demand_cache() const { return od_cache_; }
+    static constexpr uint64_t stage_age() { return kStageAge; }
     /// With io prefetch in the experts.bin tier, the mapping itself (blob() may hand out a recycled staging buffer).
     const uint8_t* blob_stable(int64_t layer, int64_t expert) override;
     int blob_parts(int64_t layer, int64_t expert, BlobPart* out) override;
@@ -962,6 +989,10 @@ public:
     IoCounters io_counters() const;
 
 private:
+    OnDemandCache* od_cache_ = nullptr;
+    struct OnDemandFileReader;   ///< the cache's reads: the files, never the cache (expert_source.cpp)
+    /// copy_blob without the on_demand cache: the RAM copy, or the files.
+    bool copy_blob_files(int64_t layer, int64_t expert, uint8_t* dst);
     const uint8_t* resident_blob(size_t index) const;
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.

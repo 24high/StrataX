@@ -1,0 +1,3 @@
+{"prompt": "What does this build output mean?\n\n   Compiling serde v1.0.210\nerror: linking with `cc` failed: exit status: 1\n  = note: /usr/bin/ld: cannot find -lssl", "task": "debugging"}
+{"prompt": "Write a shell one-liner that counts the lines of every .rs file under src and prints the total.", "task": "codegen"}
+{"prompt": "git rebase stopped with a conflict in src/lib.rs. Which commands finish the rebase after I fixed the file?", "task": "tool_use"}

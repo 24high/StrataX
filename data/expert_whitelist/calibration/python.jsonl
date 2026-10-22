@@ -1,0 +1,6 @@
+{"prompt": "Write a Python function `def chunked(it, n)` that yields lists of at most n items from any iterable.", "task": "codegen", "language": "python"}
+{"prompt": "Why does this print [1, 2] the second time?\n\ndef add(x, acc=[]):\n    acc.append(x)\n    return acc\nadd(1); print(add(2))", "response": "The default list is created once, when the function is defined, and every call shares it. Use `acc=None` and create the list inside.", "task": "debugging", "language": "python"}
+{"prompt": "TypeError: unsupported operand type(s) for +: 'int' and 'str'. Explain and fix:\n\ntotal = 0\nfor line in open('n.txt'): total += line", "task": "compiler_errors", "language": "python"}
+{"prompt": "Refactor this into a dataclass:\n\nclass P:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y", "response": "from dataclasses import dataclass\n\n@dataclass\nclass P:\n    x: float\n    y: float", "task": "refactoring", "language": "python"}
+{"prompt": "Write a pytest test for a function `slugify(s)` that lowercases, trims and replaces spaces with dashes.", "task": "codegen", "language": "python"}
+{"prompt": "This asyncio code never finishes: `asyncio.run(main())` where main awaits a Queue that nothing fills. How do I find what it waits on?", "task": "debugging", "language": "python"}

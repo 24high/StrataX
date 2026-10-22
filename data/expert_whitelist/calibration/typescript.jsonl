@@ -1,0 +1,4 @@
+{"prompt": "Write a TypeScript function `groupBy<T, K extends string>(xs: T[], key: (x: T) => K): Record<K, T[]>`.", "task": "codegen", "language": "typescript"}
+{"prompt": "error TS2345: Argument of type 'string | undefined' is not assignable to parameter of type 'string'. How do I fix it without `!`?", "task": "compiler_errors", "language": "typescript"}
+{"prompt": "Refactor this promise chain to async/await:\n\nfetch(u).then(r => r.json()).then(d => setData(d)).catch(e => setError(e));", "task": "refactoring", "language": "typescript"}
+{"prompt": "Explain what this tsconfig option does: \"strictNullChecks\": true.", "task": "repo_analysis", "language": "typescript"}

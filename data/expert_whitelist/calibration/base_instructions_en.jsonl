@@ -1,0 +1,3 @@
+{"prompt": "Explain in two short sentences what this code does, for a beginner.", "task": "explanation", "language": "en"}
+{"prompt": "Summarise the changes in this diff as a commit message of at most 72 characters per line.", "task": "explanation", "language": "en"}
+{"prompt": "I am not sure which approach is better here. List the trade-offs in plain words.", "task": "explanation", "language": "en"}

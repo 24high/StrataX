@@ -1,0 +1,63 @@
+{
+ "format_version": 1,
+ "kind": "strata-expert-whitelist",
+ "model_fingerprint": "fnv1a64:25d1f5de79ecddd4",
+ "num_layers": 3,
+ "experts_per_layer": 16,
+ "top_k": 2,
+ "mode": "tiered",
+ "layers": [
+  {
+   "layer": 0,
+   "allowed": [
+    1,
+    5
+   ],
+   "on_demand": [
+    6,
+    14
+   ],
+   "substitutes": [
+    {
+     "expert": 2,
+     "with": 1,
+     "similarity": 0.81
+    },
+    {
+     "expert": 3,
+     "with": 5,
+     "similarity": 0.77
+    }
+   ],
+   "scores": {
+    "1": 0.5,
+    "5": 0.25
+   }
+  },
+  {
+   "layer": 1,
+   "allowed": [
+    0,
+    3
+   ],
+   "on_demand": [
+    9
+   ]
+  },
+  {
+   "layer": 2,
+   "allowed": [
+    2,
+    4
+   ]
+  }
+ ],
+ "generation": {
+  "profile": "rust-coding",
+  "scoring": {
+   "method": "fixture"
+  },
+  "calibration_tokens": 0,
+  "created": "2026-10-21"
+ }
+}

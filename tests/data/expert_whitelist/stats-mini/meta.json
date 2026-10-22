@@ -1,0 +1,40 @@
+{
+  "format_version": 1,
+  "kind": "strata-routing-stats",
+  "model_fingerprint": "fnv1a64:7e80404493660979",
+  "model": {"num_layers": 4, "experts_per_layer": [16, 16, 0, 16], "top_k": 2, "hidden": 8,
+            "layer_offset": [0, 5376, 10752, 10752],
+            "blob_bytes": [336, 336, 0, 336],
+            "moe_layers": [0, 1, 3]},
+  "dense_bytes": 4224,
+  "quantization": "f32 (synthetic)",
+  "fixed_point": {"gate_frac_bits": 32, "contrib_frac_bits": 20},
+  "has_contrib": true,
+  "categories": [
+    {"key": "target|rust|codegen|prompt|prefill", "dataset": "target", "language": "rust", "task": "codegen", "region": "prompt", "origin": "prefill"},
+    {"key": "target|rust|codegen|response|prefill", "dataset": "target", "language": "rust", "task": "codegen", "region": "response", "origin": "prefill"},
+    {"key": "target|rust|compiler_errors|prompt|prefill", "dataset": "target", "language": "rust", "task": "compiler_errors", "region": "prompt", "origin": "prefill"},
+    {"key": "target|rust|compiler_errors|response|prefill", "dataset": "target", "language": "rust", "task": "compiler_errors", "region": "response", "origin": "prefill"},
+    {"key": "target|python|codegen|prompt|prefill", "dataset": "target", "language": "python", "task": "codegen", "region": "prompt", "origin": "prefill"},
+    {"key": "target|python|codegen|response|prefill", "dataset": "target", "language": "python", "task": "codegen", "region": "response", "origin": "prefill"},
+    {"key": "base|instructions|instructions|prompt|prefill", "dataset": "base", "language": "instructions", "task": "instructions", "region": "prompt", "origin": "prefill"},
+    {"key": "base|instructions|instructions|response|prefill", "dataset": "base", "language": "instructions", "task": "instructions", "region": "response", "origin": "prefill"},
+    {"key": "reference|prose|reference|prompt|prefill", "dataset": "reference", "language": "prose", "task": "reference", "region": "prompt", "origin": "prefill"}
+  ],
+  "schema_fnv1a64": "fnv1a64:dff9b4acead2c868",
+  "layer_files": [
+    {"layer": 0, "file": "layer_000.bin", "bytes": 7048, "crc32": "4dbbd822"},
+    {"layer": 1, "file": "layer_001.bin", "bytes": 7048, "crc32": "7709dbba"},
+    {"layer": 3, "file": "layer_003.bin", "bytes": 7048, "crc32": "4429e67a"}
+  ],
+  "tokens": 1169,
+  "samples": 64,
+  "run_id": "fnv1a64:0f03bc68b56fc945",
+  "runs": [{"run_id": "fnv1a64:0f03bc68b56fc945", "mode": "token", "created": "2026-10-21", "samples": 64, "tokens": 1169}],
+  "mode": "token",
+  "created": "2026-10-21",
+  "generator": "strata-routing-stats/1",
+  "run": {"mode": "token", "ram_budget": 0},
+  "collect": {"test": "routing_stats_test"},
+  "samples_done": ["rust-0001", "rust-0002", "rust-0003", "rust-0004", "rust-0005", "rust-0006", "rust-0007", "rust-0008", "rust-0009", "rust-0010", "rust-0011", "rust-0012", "rust-0013", "rust-0014", "rust-0015", "rust-0016", "rust-0017", "rust-0018", "rust-0019", "rust-0020", "rust-0021", "rust-0022", "rust-0023", "rust-0024", "python-0001", "python-0002", "python-0003", "python-0004", "python-0005", "python-0006", "python-0007", "python-0008", "python-0009", "python-0010", "python-0011", "python-0012", "python-0013", "python-0014", "python-0015", "python-0016", "base-instructions-0001", "base-instructions-0002", "base-instructions-0003", "base-instructions-0004", "base-instructions-0005", "base-instructions-0006", "base-instructions-0007", "base-instructions-0008", "base-instructions-0009", "base-instructions-0010", "base-instructions-0011", "base-instructions-0012", "reference-0001", "reference-0002", "reference-0003", "reference-0004", "reference-0005", "reference-0006", "reference-0007", "reference-0008", "reference-0009", "reference-0010", "reference-0011", "reference-0012"]
+}

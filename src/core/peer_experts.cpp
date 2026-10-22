@@ -1,5 +1,6 @@
 // src/core/peer_experts.cpp - see include/strata/core/peer_experts.hpp.
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/expert_whitelist.hpp"
 
 #include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -196,8 +197,10 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     std::vector<std::pair<int32_t, int32_t>> pick;
     std::vector<int64_t> sizes;
     uint64_t used = 0;
+    const ExpertWhitelist* const wl = active_expert_whitelist();   // --expert-whitelist: its resident tier only
     for (const auto& pr : ranked) {
         if (primary.slot_of(pr.first, pr.second) >= 0) continue;
+        if (wl != nullptr && !wl->resident(pr.first, pr.second)) continue;
         const uint64_t b = lay.blob_bytes(pr.first);
         const uint64_t b256 = lay.native ? (b + 255) / 256 * 256 : lay.max_blob;
         if (used + b256 > budget) break;

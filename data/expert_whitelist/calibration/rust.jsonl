@@ -1,0 +1,8 @@
+{"prompt": "Write a Rust function `fn median(v: &mut [i64]) -> Option<f64>` that returns the median of a slice.", "task": "codegen", "language": "rust"}
+{"prompt": "Why does this fail to compile?\n\nfn first(v: &Vec<String>) -> &str { let s = v[0].clone(); &s }", "response": "`s` is a local `String`, so `&s` would outlive it. Return `&v[0]` instead, which borrows from the argument.", "task": "compiler_errors", "language": "rust"}
+{"prompt": "error[E0502]: cannot borrow `map` as mutable because it is also borrowed as immutable. Explain the error and fix:\n\nlet x = map.get(&k); map.insert(k2, 1); println!(\"{:?}\", x);", "task": "compiler_errors", "language": "rust"}
+{"prompt": "Refactor this loop into an iterator chain:\n\nlet mut out = Vec::new(); for x in xs { if x % 2 == 0 { out.push(x * x); } }", "response": "let out: Vec<_> = xs.into_iter().filter(|x| x % 2 == 0).map(|x| x * x).collect();", "task": "refactoring", "language": "rust"}
+{"prompt": "Implement `impl std::fmt::Display for Point` for `struct Point { x: f32, y: f32 }` so it prints `(x, y)`.", "task": "codegen", "language": "rust"}
+{"prompt": "My `cargo test` hangs. The test spawns a thread that waits on a `std::sync::mpsc::Receiver`. What should I check first?", "task": "debugging", "language": "rust"}
+{"prompt": "Write an async function with tokio that fetches two URLs concurrently and returns both bodies.", "task": "codegen", "language": "rust"}
+{"prompt": "Read this Cargo.toml and tell me which crates pull in an old version of `syn`:\n\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\nclap = \"2.34\"", "task": "repo_analysis", "language": "rust"}

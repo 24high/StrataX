@@ -1,4 +1,8 @@
 #include "strata/core/logit_bias.hpp"
+#include "strata/core/expert_whitelist.hpp"
+#include "strata/core/layerwise_calib.hpp"
+#include "strata/core/routing_stats.hpp"
+#include "strata/kernels/expert_whitelist.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
@@ -130,6 +134,7 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <optional>
 #include <new>
 #include <charconv>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <cstdio>
@@ -582,6 +587,31 @@ struct Options {
     /// `expert_profile_save_min` minutes between requests.  Empty (the default): nothing is counted or written.
     std::string expert_profile_save;
     double expert_profile_save_min = 10.0;
+    /// --expert-whitelist (docs/EXPERT_WHITELIST.md, opt-in): the manifest of the routed experts this run may route to
+    /// and load.  Empty (the default): every expert, exactly as before.  `_mode` overrides the manifest's mode;
+    /// `draft_` is the MTP draft layer's own manifest or "none" (its experts unfiltered, the default); `_stats` counts
+    /// the selected and executed experts per layer and reports them at the end.
+    std::string expert_whitelist, expert_whitelist_mode, draft_expert_whitelist;
+    bool expert_whitelist_stats = false;
+    /// --expert-whitelist-cache-gib: tiered mode's on_demand cache (a fixed budget, the least recently used expert out
+    /// first); --expert-whitelist-substitute-threshold: overrides the manifest's similarity threshold (substitute mode).
+    double expert_whitelist_cache_gib = 1.0;
+    bool expert_whitelist_cache_given = false;
+    std::string expert_whitelist_substitute_threshold;
+    /// --routing-stats-out (docs/EXPERT_WHITELIST.md section 7, opt-in): run the prepared calibration samples of
+    /// --routing-stats-samples through the prompt path (teacher-forced), count every MoE layer's final routing per
+    /// category of token, write the statistics to this folder and exit.  `token` mode: each sample through all layers, as
+    /// the model runs; `layerwise`: every sample of a block through one layer before the next (Prefill::run_layer), the
+    /// rows between layers in scratch files.  Empty (the default): none of this runs.
+    std::string routing_stats_out, routing_stats_samples, routing_stats_mode = "token", routing_stats_meta,
+        routing_stats_scratch, routing_stats_spill = "f32";
+    bool routing_stats_resume = false, routing_stats_prefetch = false;
+    uint64_t routing_stats_vram = 0, routing_stats_ram = 0, routing_stats_scratch_max = 0;
+    int64_t routing_stats_block_tokens = 0, routing_stats_checkpoint_every = 64;
+    /// --routing-stats-similarity F: also the experts' output similarity (docs 7.3) on a share F of the tokens, every
+    /// expert of a layer computed on the CPU for each; --routing-stats-similarity-seed picks which tokens.
+    double routing_stats_similarity = 0.0;
+    uint64_t routing_stats_similarity_seed = 1;
     /// R4.2d: **ON by default**, because the measurement is unambiguous and the alternative is known-broken.
     /// Without it, 17 of 10,562 layers had the hit work done when the pool returned; with it, 9,190.  The
     /// A/B arm is `--no-hit-poke`.
@@ -966,6 +996,23 @@ void usage() {
                  "                       real graph that --stage-timing cannot give.  Prints and exits.\n"
                  "  --expert-profile P   R4.2e: pre-load the VRAM tier from a `profile.bin` (see\n"
                  "                       tools/make_profile.py) instead of admitting on first use.\n"
+                 "  --expert-whitelist M  route to and load only the experts the whitelist manifest M allows\n"
+                 "                       (docs/EXPERT_WHITELIST.md); the others are never chosen and never loaded\n"
+                 "  --expert-whitelist-mode strict|substitute|tiered  override the manifest's mode\n"
+                 "  --draft-expert-whitelist M|none  the MTP draft layer's own whitelist (default none: all of its experts)\n"
+                 "  --expert-whitelist-stats  count the selected and executed experts per layer, report them at the end\n"
+                 "  --expert-whitelist-cache-gib N  tiered mode: the on_demand experts' cache in RAM (default 1 GiB)\n"
+                 "  --expert-whitelist-substitute-threshold X  substitute mode: the similarity a replacement needs\n"
+                 "                       (overrides the manifest's substitute_threshold; -1..1)\n"
+                 "  --routing-stats-out D  run the prepared samples of --routing-stats-samples F (tools/whitelist_gen.py\n"
+                 "                       prepare) through the prompt path, write routing statistics to D and exit\n"
+                 "                       (docs/EXPERT_WHITELIST.md section 7; `whitelist_gen.py collect` runs this)\n"
+                 "  --routing-stats-mode token|layerwise  --routing-stats-resume  --routing-stats-meta FILE (JSON)\n"
+                 "  --routing-stats-ram-budget S  --routing-stats-vram-budget S  --routing-stats-block-tokens N\n"
+                 "  --routing-stats-scratch DIR  --routing-stats-scratch-max S  --routing-stats-spill f32|f16|bf16\n"
+                 "  --routing-stats-prefetch  --routing-stats-checkpoint-every N   (S: bytes, or 48G, 512M)\n"
+                 "  --routing-stats-similarity F  also the experts' output similarity on a share F of the tokens\n"
+                 "                       (0.01: 1%%; every expert computed on the CPU for each)  --routing-stats-similarity-seed N\n"
                  "  --expert-profile-save P  --serve, #477: save what the adaptive tier learned (the experts in\n"
                  "                       VRAM, then the routing counted since the start) as a profile at P, on\n"
                  "                       QUIT and every --expert-profile-save-every MIN minutes (default 10;\n"
@@ -1083,6 +1130,37 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
         out.push_back(id);
     }
     if (out.empty()) { err = "token list was empty"; return false; }
+    return true;
+}
+
+/// "48G", "512M", "1.5T", "2GiB" or plain bytes; K, M, G and T are binary (tools/whitelist_gen.py's sizes).
+bool parse_byte_size(const char* s, uint64_t& out) {
+    std::string t(s);
+    for (char& c : t) c = (char) std::toupper((unsigned char) c);
+    for (const char* suffix : {"IB", "B"})
+        if (t.size() > std::strlen(suffix) && t.compare(t.size() - std::strlen(suffix), std::string::npos, suffix) == 0)
+            t.resize(t.size() - std::strlen(suffix));
+    double mult = 1.0;
+    if (!t.empty() && std::strchr("KMGT", t.back()) != nullptr) {
+        mult = std::ldexp(1.0, 10 * (int) (std::strchr("KMGT", t.back()) - "KMGT" + 1));
+        t.pop_back();
+    }
+    char* end = nullptr;
+    const double v = std::strtod(t.c_str(), &end);
+    if (t.empty() || end == nullptr || *end != '\0' || !std::isfinite(v) || !(v >= 0.0) ||
+        v * mult >= 18446744073709551615.0)
+        return false;
+    out = (uint64_t) (v * mult);
+    return true;
+}
+
+/// A whole number above 0, nothing after it.
+bool parse_count(const char* s, int64_t& out) {
+    char* end = nullptr;
+    errno = 0;
+    const long long v = std::strtoll(s, &end, 10);
+    if (end == s || *end != '\0' || errno != 0 || v <= 0) return false;
+    out = (int64_t) v;
     return true;
 }
 
@@ -2266,6 +2344,255 @@ static void prime_hw_queues() {
 }
 #endif
 
+namespace {
+/// --expert-whitelist: the run's manifests and counters.  File-scope because the active pointers
+/// (strata::core::active_expert_whitelist) point here for the whole process.
+strata::core::ExpertWhitelist g_expert_wl, g_draft_wl;
+strata::core::WhitelistStats g_wl_stats;
+strata::core::OnDemandCache g_od_cache;   // tiered mode: the on_demand tier's cache (FileExpertSource::blob reads it)
+
+/// The end of a run (the one-shot generate, and the server's exit): a latched violation fails it, and
+/// --expert-whitelist-stats prints the selected (device counters) and executed (the pools) experts per layer.
+bool expert_whitelist_finish(int64_t tokens, double seconds) {
+    bool ok = !strata::core::whitelist_violated();
+    std::vector<uint64_t> sel;
+    uint64_t unmapped = 0, d_unmapped = 0;
+    std::string err;
+    if (strata::kernels::whitelist_route_active(strata::kernels::kWlMain) &&
+        !strata::kernels::whitelist_route_counts(strata::kernels::kWlMain, sel, unmapped, err)) {
+        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+        ok = false;
+    }
+    std::vector<uint64_t> dsel;
+    if (strata::kernels::whitelist_route_active(strata::kernels::kWlDraft) &&
+        !strata::kernels::whitelist_route_counts(strata::kernels::kWlDraft, dsel, d_unmapped, err)) {
+        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+        ok = false;
+    }
+    if (d_unmapped > 0) {
+        std::fprintf(stderr, "strata generate: expert whitelist: the draft layer routed %llu ids without a slot in its "
+                             "compact store\n", (unsigned long long) d_unmapped);
+        ok = false;
+    }
+    if (strata::core::WhitelistStats* ws = strata::core::whitelist_stats(); ws != nullptr && g_expert_wl.active()) {
+        const int64_t ne = g_expert_wl.experts_per_layer.empty() ? 0 : g_expert_wl.experts_per_layer[0];
+        for (size_t i = 0; i < sel.size() && ne > 0; ++i)
+            if (sel[i] > 0) ws->selected((int64_t) i / ne, (int64_t) i % ne, sel[i]);
+        ws->tokens((uint64_t) std::max<int64_t>(tokens, 0));
+        for (const std::string& line : ws->report(&g_expert_wl, seconds))
+            std::fprintf(stderr, "strata generate: %s\n", line.c_str());
+        if (ws->selected_outside(g_expert_wl) > 0 || ws->executed_outside(g_expert_wl) > 0) ok = false;
+    }
+    if (!ok) {
+        const std::string v = strata::core::whitelist_violation();
+        std::fprintf(stderr, "strata generate: the run did not keep to the expert whitelist%s%s\n", v.empty() ? "" : ": ",
+                     v.c_str());
+    }
+    return ok;
+}
+
+/// --routing-stats in layer-wise mode: the engine as the scheduler's fused model.  One layer for one sequence on the
+/// prompt path (Prefill::run_layer), with its own expert source and caches; the scheduler (src/core/layerwise_calib.cpp)
+/// orders the work, keeps the rows between layers in scratch files and counts the routing.
+class EngineLayerModel : public strata::core::LayerwiseModel {
+public:
+    EngineLayerModel(strata::prefill::Prefill& pf, strata::core::SessionState& ss, const strata::core::ModelGeometry& g,
+                     int32_t top_k, void* stream, const strata::core::ChunkOutputFeeder::ExpertOutputs* outputs = nullptr)
+        : pf_(pf), ss_(ss), g_(g), k_(top_k), stream_(stream), outputs_(outputs) {}
+    int64_t n_layers() const override { return g_.n_layers; }
+    int64_t row_floats() const override { return g_.hc * g_.n_embd; }
+    int64_t moe_floats() const override { return g_.n_embd; }
+    int32_t n_expert(int64_t) const override { return (int32_t) g_.n_expert; }
+    int32_t top_k() const override { return k_; }
+    uint64_t layer_bytes(int64_t) const override { return 0; }   // the dense weights are resident from the start
+    uint64_t expert_bytes(int64_t l) const override { return strata::kernels::cpu::expert_layout().blob_bytes(l); }
+    bool fused() const override { return true; }
+    bool forward_layer(int64_t l, const strata::core::CalibSample& s, const float* in, float* out,
+                       strata::core::RoutingSink& sink, std::string& err) override {
+        strata::core::session_zero(ss_, g_, nullptr, stream_);   // this sequence's state of this layer starts empty
+        std::vector<int64_t> toks(s.tokens.begin(), s.tokens.end());
+        if (outputs_ != nullptr) {   // --routing-stats-similarity: the sampled rows' expert outputs too
+            strata::core::ChunkOutputFeeder feeder(sink, k_, (int32_t) g_.n_expert, g_.n_embd, *outputs_);
+            bind_feeder(pf_, feeder);
+            const bool ok = pf_.run_layer(l, toks.data(), (int64_t) toks.size(), in, out, err);
+            unbind_feeder(pf_);
+            return ok && feeder.ok(err);
+        }
+        pf_.on_routing = [&sink](int64_t layer, int64_t p0, int64_t T, const int32_t* ids, const float* w) {
+            sink.routed(layer, p0, T, ids, w, nullptr);
+        };
+        const bool ok = pf_.run_layer(l, toks.data(), (int64_t) toks.size(), in, out, err);
+        pf_.on_routing = nullptr;
+        return ok;
+    }
+    /// The prompt path's routing and expert input to a ChunkOutputFeeder, and back.
+    static void bind_feeder(strata::prefill::Prefill& pf, strata::core::ChunkOutputFeeder& f) {
+        pf.on_routing = [&f](int64_t layer, int64_t p0, int64_t T, const int32_t* ids, const float* w) { f.routed(layer, p0, T, ids, w); };
+        pf.moe_rows_wanted = [&f](int64_t layer, int64_t p0, int64_t T, std::vector<int32_t>& rows) { f.wanted(layer, p0, T, rows); };
+        pf.on_moe_rows = [&f](int64_t layer, int64_t p0, const int32_t* rows, int64_t n, const float* x) {
+            f.moe_rows(layer, p0, rows, n, x);
+        };
+    }
+    static void unbind_feeder(strata::prefill::Prefill& pf) {
+        pf.on_routing = nullptr;
+        pf.moe_rows_wanted = nullptr;
+        pf.on_moe_rows = nullptr;
+    }
+    // the split form's pieces: the engine runs whole layers
+    bool embed(const strata::core::CalibSample&, float*, std::string& err) override { return no(err); }
+    bool load_layer(int64_t, std::string& err) override { return no(err); }
+    void release_layer(int64_t) override {}
+    bool mixer(int64_t, const strata::core::CalibSample&, float*, float*, std::string& err) override { return no(err); }
+    bool route(int64_t, const float*, int64_t, int32_t*, float*, std::string& err) override { return no(err); }
+    bool load_expert(int64_t, int32_t, std::string& err) override { return no(err); }
+    void release_expert(int64_t, int32_t) override {}
+    bool run_expert(int64_t, int32_t, const float*, int64_t, float*, std::string& err) override { return no(err); }
+    bool combine(int64_t, const strata::core::CalibSample&, float*, const float*, const float*, std::string& err) override {
+        return no(err);
+    }
+
+private:
+    static bool no(std::string& err) {
+        err = "internal: the engine's layer-wise model runs whole layers";
+        return false;
+    }
+    strata::prefill::Prefill& pf_;
+    strata::core::SessionState& ss_;
+    const strata::core::ModelGeometry& g_;
+    int32_t k_;
+    void* stream_;
+    const strata::core::ChunkOutputFeeder::ExpertOutputs* outputs_;
+};
+
+/// What the pack's experts are: the native layout's header names the GGUF they come from, a canonical pack is Q2_0.
+std::string pack_quantization(const std::string& pack) {
+    std::ifstream f(pack + "/native_experts.txt");
+    std::string line;
+    if (f && std::getline(f, line)) {
+        const size_t at = line.find("absolute offsets in ");
+        if (at != std::string::npos) {
+            std::string gguf = line.substr(at + 20);
+            gguf = gguf.substr(0, gguf.find_first_of(", "));
+            return "native experts from " + gguf;
+        }
+        return "native experts (" + line.substr(0, 120) + ")";
+    }
+    return "canonical pack (Q2_0 experts)";
+}
+
+/// --routing-stats-out: every prepared sample through the prompt path (token mode) or layer by layer (layer-wise),
+/// the statistics written to the folder.  The model's routing is not changed and nothing is generated.
+bool routing_stats_run(const Options& o, strata::prefill::Prefill& prefill, strata::core::SessionState& ss,
+                       const strata::core::ModelGeometry& g, const strata::core::CalibSet& set, int64_t K,
+                       uint64_t dense_bytes, void* stream, strata::core::ExpertSource* expert_src) {
+    using namespace strata::core;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    RoutingStatsSchema schema;
+    schema.model.n_layers = g.n_layers;
+    schema.model.experts_per_layer.assign((size_t) g.n_layers, (int32_t) g.n_expert);
+    schema.model.top_k = K;
+    schema.model.hidden = g.n_embd;
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        schema.model.layer_offset.push_back(lay.layer_offset(l));
+        schema.model.blob_bytes.push_back(lay.blob_bytes(l));
+    }
+    schema.fingerprint = whitelist_fingerprint(schema.model);   // the fingerprint the whitelist manifest will carry
+    schema.categories = set.categories;
+    schema.has_contrib = false;   // the prompt path's grouped experts give no per-pick output norm (docs 7.9)
+    schema.quantization = pack_quantization(o.pack);
+    schema.dense_bytes = dense_bytes;
+    // --routing-stats-similarity: the prompt path hands over the sampled rows' expert input, every expert of the layer is
+    // computed on them on the CPU (the verify window's kernels) in a pool of its own, never the prompt path's CPU share's
+    schema.similarity.fraction = o.routing_stats_similarity;
+    schema.similarity.seed = o.routing_stats_similarity_seed;
+    std::unique_ptr<strata::kernels::cpu::ExpertPool> sim_pool;
+    ChunkOutputFeeder::ExpertOutputs outputs;
+    if (schema.similarity.on()) {
+        sim_pool = std::make_unique<strata::kernels::cpu::ExpertPool>(o.pool_workers, /*pin=*/false, /*host_works=*/true,
+                                                                       o.pool_affinity, o.pool_tasks);
+        outputs = [&sim_pool, expert_src, &g](int64_t l, const float* x, int64_t n, float* y, std::string& e) {
+            return expert_outputs_cpu(expert_src, *sim_pool, l, x, n, g.n_embd, y, e);
+        };
+        int64_t sampled = 0;
+        for (const CalibSample& s : set.samples) sampled += similarity_sampled_count(schema.similarity, s.id, (int64_t) s.tokens.size());
+        std::fprintf(stderr, "strata generate: routing stats: the experts' similarity on %lld sampled tokens (share %g, seed "
+                             "%llu): every expert of every MoE layer computed on the CPU for each (%d threads)\n",
+                     (long long) sampled, schema.similarity.fraction, (unsigned long long) schema.similarity.seed,
+                     sim_pool->workers() + 1);
+    }
+    CollectOptions co;
+    co.out_dir = o.routing_stats_out;
+    co.resume = o.routing_stats_resume;
+    co.checkpoint_every = o.routing_stats_checkpoint_every;
+    co.ram_budget = o.routing_stats_ram;
+    co.run.mode = o.routing_stats_mode;
+    co.run.generator = std::string("strata generate ") + STRATA_VERSION;
+    co.log = [](const std::string& line) { std::fprintf(stderr, "strata generate: routing stats: %s\n", line.c_str()); };
+    std::string err;
+    if (!o.routing_stats_meta.empty()) {   // the caller's description of the run (inputs' hashes, parameters), verbatim
+        std::ifstream f(o.routing_stats_meta, std::ios::binary);
+        std::stringstream text;
+        text << f.rdbuf();
+        std::string j = text.str();
+        while (!j.empty() && std::isspace((unsigned char) j.back())) j.pop_back();
+        size_t b = 0;
+        while (b < j.size() && std::isspace((unsigned char) j[b])) ++b;
+        if (!f || b >= j.size() || j[b] != '{' || j.back() != '}') {
+            std::fprintf(stderr, "strata generate: --routing-stats-meta %s is not a JSON object\n", o.routing_stats_meta.c_str());
+            return false;
+        }
+        co.run.collect_json = j.substr(b);
+    }
+    prefill.on_chunk = nullptr;   // the MTP draft layer's K/V: not needed for statistics
+    CollectReport rep;
+    bool ok;
+    if (o.routing_stats_mode == "token") {
+        auto runner = [&](const CalibSample& s, RoutingSink& sink, std::string& e) -> bool {
+            session_zero(ss, g, nullptr, stream);   // every sample is its own sequence from position 0
+            std::vector<int64_t> toks(s.tokens.begin(), s.tokens.end());
+            if (outputs) {
+                ChunkOutputFeeder feeder(sink, (int32_t) K, (int32_t) g.n_expert, g.n_embd, outputs);
+                EngineLayerModel::bind_feeder(prefill, feeder);
+                const bool r = prefill.run(toks.data(), (int64_t) toks.size(), 0, e);
+                EngineLayerModel::unbind_feeder(prefill);
+                return r && feeder.ok(e);
+            }
+            prefill.on_routing = [&sink](int64_t layer, int64_t p0, int64_t T, const int32_t* ids, const float* w) {
+                sink.routed(layer, p0, T, ids, w, nullptr);
+            };
+            const bool r = prefill.run(toks.data(), (int64_t) toks.size(), 0, e);
+            prefill.on_routing = nullptr;
+            return r;
+        };
+        ok = collect_token_mode(set, schema, runner, co, rep, err);
+    } else {
+        EngineLayerModel m(prefill, ss, g, (int32_t) K, stream, outputs ? &outputs : nullptr);
+        LayerwiseConfig c;
+        c.vram_budget = o.routing_stats_vram;
+        c.ram_budget = o.routing_stats_ram;
+        c.block_tokens = o.routing_stats_block_tokens;
+        c.scratch_dir = o.routing_stats_scratch;
+        c.scratch_max = o.routing_stats_scratch_max;
+        parse_spill_precision(o.routing_stats_spill, c.spill);
+        c.prefetch = o.routing_stats_prefetch;
+        if (c.vram_budget > 0 || c.prefetch)
+            std::fprintf(stderr, "strata generate: routing stats: the engine places its own weights and buffers (its "
+                                 "usual options); --routing-stats-vram-budget and --routing-stats-prefetch apply to the "
+                                 "scheduler's split form only\n");
+        ok = collect_layerwise(m, set, schema, c, co, rep, nullptr, err);
+    }
+    if (!ok) {
+        std::fprintf(stderr, "strata generate: routing stats: %s\n", err.c_str());
+        return false;
+    }
+    std::fprintf(stderr, "strata generate: routing stats: %lld samples (%lld tokens) in %.1f s%s, %lld skipped as done; "
+                         "the collector's RAM peak %.1f MiB -> %s\n", (long long) rep.samples, (long long) rep.tokens,
+                 rep.seconds, rep.resumed ? " (resumed)" : "", (long long) rep.samples_skipped,
+                 (double) rep.ram_peak / 1048576.0, o.routing_stats_out.c_str());
+    return true;
+}
+}  // namespace
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -2346,7 +2673,17 @@ int main(int argc, char** argv) {
         } catch (const std::exception&) {
             // not readable here: the normal path below reports it
         }
-        if (qwen35) return strata::qwen35::run(argc, argv);
+        if (qwen35) {
+            // --expert-whitelist is wired into this engine's routing and loading only; the Qwen3.6 engine would ignore
+            // it, and a whitelist that is silently not applied is the one outcome it must never have
+            for (int j = 1; j < argc; ++j)
+                if (std::strncmp(argv[j], "--expert-whitelist", 18) == 0 || std::strcmp(argv[j], "--draft-expert-whitelist") == 0 ||
+                    std::strncmp(argv[j], "--routing-stats", 15) == 0) {
+                    std::fprintf(stderr, "strata generate: %s is not supported for Qwen3.6 (qwen35moe) models yet\n", argv[j]);
+                    return 2;
+                }
+            return strata::qwen35::run(argc, argv);
+        }
         break;
     }
 #endif
@@ -2680,6 +3017,66 @@ int main(int argc, char** argv) {
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--expert-profile-save") o.expert_profile_save = next("--expert-profile-save");
+        else if (a == "--expert-whitelist") o.expert_whitelist = next("--expert-whitelist");
+        else if (a == "--expert-whitelist-mode") o.expert_whitelist_mode = next("--expert-whitelist-mode");
+        else if (a == "--draft-expert-whitelist") o.draft_expert_whitelist = next("--draft-expert-whitelist");
+        else if (a == "--expert-whitelist-stats") o.expert_whitelist_stats = true;
+        else if (a == "--expert-whitelist-cache-gib") {
+            o.expert_whitelist_cache_gib = std::atof(next("--expert-whitelist-cache-gib"));
+            o.expert_whitelist_cache_given = true;
+            if (!(o.expert_whitelist_cache_gib > 0.0)) {
+                std::fprintf(stderr, "strata generate: --expert-whitelist-cache-gib needs N > 0\n");
+                return 2;
+            }
+        }
+        else if (a == "--expert-whitelist-substitute-threshold")
+            o.expert_whitelist_substitute_threshold = next("--expert-whitelist-substitute-threshold");
+        else if (a == "--routing-stats-out") o.routing_stats_out = next("--routing-stats-out");
+        else if (a == "--routing-stats-samples") o.routing_stats_samples = next("--routing-stats-samples");
+        else if (a == "--routing-stats-mode") o.routing_stats_mode = next("--routing-stats-mode");
+        else if (a == "--routing-stats-meta") o.routing_stats_meta = next("--routing-stats-meta");
+        else if (a == "--routing-stats-resume") o.routing_stats_resume = true;
+        else if (a == "--routing-stats-prefetch") o.routing_stats_prefetch = true;
+        else if (a == "--routing-stats-scratch") o.routing_stats_scratch = next("--routing-stats-scratch");
+        else if (a == "--routing-stats-spill") o.routing_stats_spill = next("--routing-stats-spill");
+        else if (a == "--routing-stats-similarity") {
+            const char* v = next("--routing-stats-similarity");
+            char* end = nullptr;
+            o.routing_stats_similarity = std::strtod(v, &end);
+            if (end == v || *end != '\0' || !(o.routing_stats_similarity > 0.0 && o.routing_stats_similarity <= 1.0)) {
+                std::fprintf(stderr, "strata generate: --routing-stats-similarity takes a share above 0 and up to 1, not '%s'\n", v);
+                return 2;
+            }
+        }
+        else if (a == "--routing-stats-similarity-seed") {
+            const char* v = next("--routing-stats-similarity-seed");
+            char* end = nullptr;
+            o.routing_stats_similarity_seed = std::strtoull(v, &end, 10);
+            if (end == v || *end != '\0') {
+                std::fprintf(stderr, "strata generate: --routing-stats-similarity-seed takes a whole number, not '%s'\n", v);
+                return 2;
+            }
+        }
+        else if (a == "--routing-stats-block-tokens" || a == "--routing-stats-checkpoint-every") {
+            const std::string flag = a;
+            const char* v = next(flag.c_str());
+            if (!parse_count(v, flag == "--routing-stats-block-tokens" ? o.routing_stats_block_tokens
+                                                                       : o.routing_stats_checkpoint_every)) {
+                std::fprintf(stderr, "strata generate: %s takes a whole number above 0, not '%s'\n", flag.c_str(), v);
+                return 2;
+            }
+        }
+        else if (a == "--routing-stats-ram-budget" || a == "--routing-stats-vram-budget" || a == "--routing-stats-scratch-max") {
+            const std::string flag = a;
+            const char* v = next(flag.c_str());
+            uint64_t bytes = 0;
+            if (!parse_byte_size(v, bytes)) {
+                std::fprintf(stderr, "strata generate: %s takes a size (48G, 512M or bytes), not '%s'\n", flag.c_str(), v);
+                return 2;
+            }
+            (flag == "--routing-stats-ram-budget" ? o.routing_stats_ram
+             : flag == "--routing-stats-vram-budget" ? o.routing_stats_vram : o.routing_stats_scratch_max) = bytes;
+        }
         else if (a == "--expert-profile-save-every")
             o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
         else if (a == "--gpu-stages") o.gpu_stages = true;
@@ -2946,6 +3343,129 @@ int main(int argc, char** argv) {
         return 2;
     }
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
+    // ---- --expert-whitelist (docs/EXPERT_WHITELIST.md): what it needs and what it refuses, before any expert is placed
+    if (o.expert_whitelist.empty() && (!o.expert_whitelist_mode.empty() || o.expert_whitelist_stats ||
+                                       o.expert_whitelist_cache_given || !o.expert_whitelist_substitute_threshold.empty())) {
+        std::fprintf(stderr, "strata generate: --expert-whitelist-mode, -stats, -cache-gib and -substitute-threshold need "
+                             "--expert-whitelist\n");
+        return 2;
+    }
+    double wl_sub_threshold = 0.0;
+    if (!o.expert_whitelist_substitute_threshold.empty()) {
+        char* end = nullptr;
+        wl_sub_threshold = std::strtod(o.expert_whitelist_substitute_threshold.c_str(), &end);
+        if (end == nullptr || *end != '\0' || !(wl_sub_threshold >= -1.0 && wl_sub_threshold <= 1.0)) {
+            std::fprintf(stderr, "strata generate: --expert-whitelist-substitute-threshold takes a number from -1 to 1, "
+                                 "not '%s'\n", o.expert_whitelist_substitute_threshold.c_str());
+            return 2;
+        }
+    }
+    if (!o.expert_whitelist_mode.empty()) {
+        strata::core::WhitelistMode m;
+        if (!strata::core::parse_whitelist_mode(o.expert_whitelist_mode, m)) {
+            std::fprintf(stderr, "strata generate: --expert-whitelist-mode takes strict, substitute or tiered, not '%s'\n",
+                         o.expert_whitelist_mode.c_str());
+            return 2;
+        }
+    }
+    // ---- --routing-stats (docs/EXPERT_WHITELIST.md section 7): what it needs and refuses.  The samples are read now: the
+    // longest one stands in for the prompt, so the prompt path's buffers and the K/V are sized as for a one-shot prompt
+    strata::core::CalibSet routing_set;
+    if (o.routing_stats_similarity > 0.0 && o.routing_stats_out.empty()) {
+        std::fprintf(stderr, "strata generate: --routing-stats-similarity needs --routing-stats-out\n");
+        return 2;
+    }
+    if (!o.routing_stats_out.empty() || !o.routing_stats_samples.empty()) {
+        std::string rs_err;
+        strata::core::SpillPrecision rs_spill;
+#if defined(STRATA_GPU_METAL)
+        std::fprintf(stderr, "strata generate: --routing-stats-out is not wired to the Metal engine yet\n");
+        return 2;
+#endif
+        if (o.routing_stats_out.empty() || o.routing_stats_samples.empty()) {
+            std::fprintf(stderr, "strata generate: --routing-stats-out and --routing-stats-samples go together\n");
+            return 2;
+        }
+        if (o.routing_stats_mode != "token" && o.routing_stats_mode != "layerwise") {
+            std::fprintf(stderr, "strata generate: --routing-stats-mode takes token or layerwise, not '%s'\n",
+                         o.routing_stats_mode.c_str());
+            return 2;
+        }
+        if (!strata::core::parse_spill_precision(o.routing_stats_spill, rs_spill)) {
+            std::fprintf(stderr, "strata generate: --routing-stats-spill takes f32, f16 or bf16\n");
+            return 2;
+        }
+        if (o.serve || have_tokens) {
+            std::fprintf(stderr, "strata generate: --routing-stats-out runs its own samples and exits: not with --serve or "
+                                 "--tokens\n");
+            return 2;
+        }
+        if (!o.expert_whitelist.empty()) {
+            std::fprintf(stderr, "strata generate: routing statistics are collected on the full model: not with "
+                                 "--expert-whitelist\n");
+            return 2;
+        }
+        if (std::getenv("STRATA_DBG_ROUTE_OVERRIDE") != nullptr) {
+            std::fprintf(stderr, "strata generate: STRATA_DBG_ROUTE_OVERRIDE replaces the model's routing: unset it to "
+                                 "collect routing statistics\n");
+            return 2;
+        }
+        if (!strata::core::read_calib_samples(o.routing_stats_samples, routing_set, rs_err)) {
+            std::fprintf(stderr, "strata generate: %s\n", rs_err.c_str());
+            return 1;
+        }
+        if (routing_set.samples.empty()) {
+            std::fprintf(stderr, "strata generate: %s holds no samples\n", o.routing_stats_samples.c_str());
+            return 1;
+        }
+        const strata::core::CalibSample* longest = &routing_set.samples[0];
+        for (const strata::core::CalibSample& s : routing_set.samples)
+            if (s.tokens.size() > longest->tokens.size()) longest = &s;
+        o.tokens.assign(longest->tokens.begin(), longest->tokens.end());
+        o.tokens.push_back(longest->tokens.back());   // one more: every sample token goes through the prompt path
+        o.max_new = 1;
+        have_tokens = true;
+        std::fprintf(stderr, "strata generate: routing stats: %zu samples (%lld tokens, the longest %zu), %zu categories, "
+                             "%s mode -> %s\n", routing_set.samples.size(), (long long) routing_set.tokens(),
+                     longest->tokens.size(), routing_set.categories.size(), o.routing_stats_mode.c_str(),
+                     o.routing_stats_out.c_str());
+    }
+    if (!o.draft_expert_whitelist.empty() && o.draft_expert_whitelist != "none" && o.mtp.empty()) {
+        std::fprintf(stderr, "strata generate: --draft-expert-whitelist is for the MTP draft layer and needs --mtp\n");
+        return 2;
+    }
+    if (!o.expert_whitelist.empty()) {
+        if (!o.shared_expert_arena.empty()) {
+            std::fprintf(stderr, "strata generate: --shared-expert-arena holds every expert and cannot be used with "
+                                 "--expert-whitelist\n");
+            return 2;
+        }
+        if (const char* v = std::getenv("STRATA_FS_SLOTS"); v != nullptr && std::atoi(v) > 0) {
+            std::fprintf(stderr, "strata generate: the Foresight swap space (STRATA_FS_SLOTS) copies predicted experts and "
+                                 "is not wired to --expert-whitelist yet; unset it\n");
+            return 2;
+        }
+        if (!o.mmap_experts) {
+            // the default source (the RAM arena) reads every expert at start, which the whitelist forbids.  With a profile
+            // the run takes the --resident-experts form: the mapped files plus a compact RAM copy of the allowed experts
+            // the VRAM cache does not hold (its explicit offset table is the original-id -> slot map); without one the
+            // mapped files alone, read only where an allowed expert is routed.
+            o.mmap_experts = true;
+            if (!o.expert_profile.empty()) {
+                o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
+                o.resident_headroom = 4ull << 30;
+                if (const char* v = std::getenv("STRATA_RESIDENT_PIN"); v != nullptr && std::string(v) == "0")
+                    o.resident_pin = false;
+                if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr && std::atof(v) >= 0.0)
+                    o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
+                std::fprintf(stderr, "strata generate: expert whitelist: the experts come from the mapped files with a RAM "
+                                     "copy of the allowed ones only (the --resident-experts form)\n");
+            } else {
+                std::fprintf(stderr, "strata generate: expert whitelist: no --expert-profile, so no VRAM cache fill and no "
+                                     "RAM copy: allowed experts are read from the mapped files when routed\n");
+            }
+        }
+    }
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
         std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
         return 2;
@@ -3648,6 +4168,94 @@ int main(int argc, char** argv) {
                              rope_cfg.type == RST::YaRN ? "YaRN" : "--yarn-attn-factor", rope_cfg.mscale());
         }
     }
+    // ---- --expert-whitelist: read and checked against THIS model (its geometry and the pack's expert index) before any
+    // expert is placed, then the routing tables go to every GPU the run routes on, before any graph is captured
+    strata::core::ExpertWhitelist& expert_wl = g_expert_wl;
+    strata::core::ExpertWhitelist& draft_wl = g_draft_wl;
+    strata::core::WhitelistStats& wl_stats = g_wl_stats;
+    if (!o.expert_whitelist.empty() || (!o.draft_expert_whitelist.empty() && o.draft_expert_whitelist != "none")) {
+        const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+        if (lay.n_layers != g.n_layers || lay.n_expert != g.n_expert) {
+            std::fprintf(stderr, "strata generate: expert whitelist: the pack's expert layout (%lld x %lld) is not the model's "
+                                 "(%lld x %lld)\n", (long long) lay.n_layers, (long long) lay.n_expert,
+                         (long long) g.n_layers, (long long) g.n_expert);
+            return 1;
+        }
+        strata::core::WhitelistMode mode_override = strata::core::WhitelistMode::Strict;
+        const bool overridden = !o.expert_whitelist_mode.empty() &&
+                                strata::core::parse_whitelist_mode(o.expert_whitelist_mode, mode_override);
+        std::vector<int> wl_devices{primary_device};
+        if (multi_gpu) wl_devices.insert(wl_devices.end(), split_devs.begin(), split_devs.end());
+        for (int r = 0; r < 3; ++r)
+            if (o.expert_cache_remote[(size_t) r] > 0) wl_devices.push_back(remote_dev[r]);
+        if (o.peer_device >= 1) wl_devices.push_back(o.peer_device);
+        if (!o.expert_whitelist.empty()) {
+            strata::core::WhitelistModelInfo info;
+            info.n_layers = g.n_layers;
+            info.experts_per_layer.assign((size_t) g.n_layers, (int32_t) g.n_expert);
+            info.top_k = K;
+            info.hidden = g.n_embd;
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                info.layer_offset.push_back(lay.layer_offset(l));
+                info.blob_bytes.push_back(lay.blob_bytes(l));
+            }
+            bool sidecar = false;
+            if (!strata::core::check_expert_index_sidecar(o.pack, info, sidecar, err) ||
+                !strata::core::load_expert_whitelist(o.expert_whitelist, info, overridden ? &mode_override : nullptr,
+                                                     expert_wl, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            if (!o.expert_whitelist_substitute_threshold.empty()) expert_wl.apply_substitute_threshold(true, wl_sub_threshold);
+            if (o.expert_whitelist_cache_given && expert_wl.mode != strata::core::WhitelistMode::Tiered)
+                std::fprintf(stderr, "strata generate: expert whitelist: --expert-whitelist-cache-gib is for the tiered mode; "
+                                     "ignored in %s mode\n", strata::core::whitelist_mode_name(expert_wl.mode));
+            strata::core::set_active_expert_whitelist(&expert_wl);
+            for (const std::string& line : strata::core::whitelist_report(expert_wl))
+                std::fprintf(stderr, "strata generate: %s\n", line.c_str());
+            uint64_t res_b = 0, od_b = 0, all_b = 0;
+            strata::core::whitelist_bytes(expert_wl, info.blob_bytes, res_b, od_b);
+            for (int64_t l = 0; l < g.n_layers; ++l) all_b += info.blob_bytes[(size_t) l] * (uint64_t) g.n_expert;
+            std::fprintf(stderr, "strata generate: expert whitelist: estimated expert weights %.2f GiB allowed of %.2f GiB%s%s; "
+                                 "expert offsets %s\n", (double) res_b / 1073741824.0, (double) all_b / 1073741824.0,
+                         od_b > 0 ? ", on_demand " : "", od_b > 0 ? (std::to_string(od_b >> 20) + " MiB").c_str() : "",
+                         sidecar ? "from the pack's experts.index.json (checked)" : "computed from the pack's layout");
+            if (o.expert_whitelist_stats) {
+                wl_stats.reset(g.n_layers, g.n_expert);
+                strata::core::set_whitelist_stats(&wl_stats);
+            }
+            if (!strata::kernels::whitelist_route_upload(strata::kernels::kWlMain, &expert_wl, wl_devices,
+                                                         o.expert_whitelist_stats, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+        }
+        if (!o.draft_expert_whitelist.empty() && o.draft_expert_whitelist != "none") {
+            // the MTP draft layer: one layer of the canonical geometry's experts, in its own experts.bin (tools/mtp_rt.py)
+            const strata::core::ModelGeometry dg{};
+            strata::core::WhitelistModelInfo dinfo;
+            dinfo.n_layers = 1;
+            dinfo.experts_per_layer = {(int32_t) dg.n_expert};
+            dinfo.top_k = dg.n_expert_used;
+            dinfo.hidden = dg.n_embd;
+            dinfo.layer_offset = {0};
+            dinfo.blob_bytes = {(uint64_t) strata::kernels::cpu::BLOB};
+            if (!strata::core::load_expert_whitelist(o.draft_expert_whitelist, dinfo, nullptr, draft_wl, err)) {
+                std::fprintf(stderr, "strata generate: draft %s\n", err.c_str());
+                return 1;
+            }
+            strata::core::set_active_draft_whitelist(&draft_wl);
+            for (const std::string& line : strata::core::whitelist_report(draft_wl))
+                std::fprintf(stderr, "strata generate: draft %s\n", line.c_str());
+            if (!strata::kernels::whitelist_route_upload(strata::kernels::kWlDraft, &draft_wl, wl_devices, false, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+        } else if (!o.expert_whitelist.empty() && !o.mtp.empty()) {
+            std::fprintf(stderr, "strata generate: expert whitelist: the MTP draft layer has no whitelist (all of its experts; "
+                                 "--draft-expert-whitelist M sets one); the verify window keeps every output to the whitelist\n");
+        }
+    }
     strata::core::NativeEmbed native_embed;
     if (native_pack) {
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
@@ -4315,6 +4923,24 @@ int main(int argc, char** argv) {
         if (!strata::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, profile, pslots, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
+        }
+        // --expert-whitelist: the ranking every placement reads (the VRAM fill, the RAM copy's rank, the stages, the
+        // peer and helper GPUs) keeps the whitelist's resident tier only, in the profile's order; allowed experts the
+        // profile does not rank follow, in layer order, so the cache can still hold every one of them
+        if (const strata::core::ExpertWhitelist* wl = strata::core::active_expert_whitelist(); wl != nullptr) {
+            const int64_t dropped = strata::core::whitelist_filter_pairs(profile, *wl);
+            std::vector<uint8_t> ranked((size_t) (g.n_layers * g.n_expert), 0);
+            for (const auto& pr : profile) ranked[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 1;
+            size_t added = 0;
+            for (int32_t l = 0; l < (int32_t) g.n_layers; ++l)
+                for (int32_t e = 0; e < (int32_t) g.n_expert; ++e)
+                    if (wl->resident(l, e) && !ranked[(size_t) l * (size_t) g.n_expert + (size_t) e]) {
+                        profile.emplace_back(l, e);
+                        ++added;
+                    }
+            std::fprintf(stderr, "strata generate: expert whitelist: the profile keeps %zu allowed experts (%lld blocked "
+                                 "ones dropped, %zu unranked allowed ones added last)\n", profile.size(), (long long) dropped,
+                         added);
         }
         // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the
         // file).  `--expert-cache 0` used to take the count the profile was built for; the profile now ranks
@@ -5570,6 +6196,22 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: experts via mmap (--mmap-experts; %s)\n",
                      src.gguf_mode() ? "the GGUF shards in place, no experts.bin" : "the A/B arm of R2.1");
+        // --expert-whitelist, tiered: the on_demand experts the router picks are kept in a cache with a fixed budget (the
+        // least recently used one out first); a pointer it hands out holds as the stage buffers' do
+        if (const strata::core::ExpertWhitelist* wl = strata::core::active_expert_whitelist();
+            wl != nullptr && wl->mode == strata::core::WhitelistMode::Tiered && wl->total(strata::core::kWlOnDemand) > 0) {
+            const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+            std::vector<uint64_t> blob_bytes;
+            for (int64_t l = 0; l < g.n_layers; ++l) blob_bytes.push_back(lay.blob_bytes(l));
+            const uint64_t budget = (uint64_t) (o.expert_whitelist_cache_gib * 1073741824.0);
+            if (!g_od_cache.init(*wl, blob_bytes, budget, strata::core::FileExpertSource::stage_age(), err)) {
+                std::fprintf(stderr, "strata generate: expert whitelist: %s (--expert-whitelist-cache-gib)\n", err.c_str());
+                return 1;
+            }
+            src.set_on_demand_cache(&g_od_cache);
+            std::fprintf(stderr, "strata generate: expert whitelist: tiered: an on_demand cache of %.2f GiB (the least "
+                                 "recently used expert out first)\n", (double) budget / 1073741824.0);
+        }
         // #286: with a RAM budget the hottest experts live in it, and the rest are read from the drive unbuffered
         // when the file cache could not keep them beside the budget anyway (a 32 GB PC) - the mapped reads' page
         // faults are small requests on the critical path, and their pages take the RAM the budget was sized for
@@ -6297,6 +6939,24 @@ int main(int argc, char** argv) {
                              "slot 0 verified\n",
                      (long long) prefilled, (long long) (per_layer ? xcache.slots() : want), fill_s,
                      fill_s > 0 ? (double) fill_bytes / 1e6 / fill_s : 0.0);
+        // --expert-whitelist: what the VRAM cache really holds, checked expert by expert (a blocked one is a hard error)
+        if (const strata::core::ExpertWhitelist* wl = strata::core::active_expert_whitelist(); wl != nullptr) {
+            int64_t held = 0;
+            uint64_t held_bytes = 0;
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e) {
+                    if (xcache.slot_of(l, e) < 0) continue;
+                    if (!wl->resident(l, e)) {
+                        strata::core::whitelist_note_violation(l, e, "the VRAM cache's profile fill");
+                        std::fprintf(stderr, "strata generate: %s\n", strata::core::whitelist_violation().c_str());
+                        return 1;
+                    }
+                    ++held;
+                    held_bytes += strata::kernels::cpu::expert_layout().blob_bytes(l);
+                }
+            std::fprintf(stderr, "strata generate: expert whitelist: the VRAM cache holds %lld allowed experts (%.2f GiB), no "
+                                 "blocked one\n", (long long) held, (double) held_bytes / 1073741824.0);
+        }
         if (std::getenv("STRATA_VERIFY_COMPLEMENT") != nullptr) {
             // tests: the filled slots' checksum (each slot's blob read back and hashed, then the hashes in slot order)
             std::vector<std::pair<int32_t, int64_t>> sl;   // (slot, blob bytes)
@@ -8046,6 +8706,24 @@ int main(int argc, char** argv) {
                 !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
                 return 1;
+            }
+            // --expert-whitelist: what the RAM copy really holds, checked expert by expert (a blocked one is a hard error)
+            if (const strata::core::ExpertWhitelist* wl = strata::core::active_expert_whitelist(); wl != nullptr) {
+                int64_t held = 0;
+                for (int64_t l = 0; l < g.n_layers; ++l)
+                    for (int64_t e = 0; e < g.n_expert; ++e) {
+                        if (!src.has_resident(l, e)) continue;
+                        if (!wl->resident(l, e)) {
+                            strata::core::whitelist_note_violation(l, e, "the resident RAM copy");
+                            std::fprintf(stderr, "strata generate: %s\n", strata::core::whitelist_violation().c_str());
+                            return 1;
+                        }
+                        ++held;
+                    }
+                std::fprintf(stderr, "strata generate: expert whitelist: the RAM copy holds %lld allowed experts (%.2f GiB), "
+                                     "no blocked one; the rest of the allowed experts are in VRAM%s\n", (long long) held,
+                             (double) src.resident_bytes() / 1073741824.0,
+                             wl->mode == strata::core::WhitelistMode::Tiered ? ", the on_demand tier on the drive" : "");
             }
             std::fprintf(stderr, "strata generate: resident RAM mode: %.2f GiB of experts in RAM (%s), %lld in the GPU "
                                  "cache; adaptive swaps %s\n",
@@ -15409,6 +16087,7 @@ int main(int argc, char** argv) {
             }
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
+        if (!expert_whitelist_finish(0, 0.0)) return 1;   // --expert-whitelist: a violation fails the run, the stats
 #if defined(STRATA_GPU_METAL)
         // the stdin reader (detached above) may still take in_mu when the server closes the pipe after QUIT; on macOS
         // locking that mutex once this scope has destroyed it throws (the engine ended with an abort): end here
@@ -15528,6 +16207,10 @@ int main(int argc, char** argv) {
             kvg_start(xcache.slots());
             if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
         }
+        // --routing-stats (docs/EXPERT_WHITELIST.md section 7): the samples instead of the prompt, then the run ends
+        if (!o.routing_stats_out.empty())
+            return routing_stats_run(o, prefill, ss, g, routing_set, (int64_t) K,
+                                     o.native_dense_gguf.empty() ? (uint64_t) pool_bytes : 0, main_cs, srcp) ? 0 : 1;
         const Clock::time_point tp0 = Clock::now();
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -15578,6 +16261,11 @@ int main(int argc, char** argv) {
                                  "(STRATA_MMQ_DIRECT)\n", (long long) ps.experts_direct, (long long) ps.experts_resident);
     }
 
+    if (!o.routing_stats_out.empty()) {   // the samples go through the batched prompt path, which is off
+        std::fprintf(stderr, "strata generate: --routing-stats-out reads its samples through the batched prompt path: "
+                             "give --prefill N (or auto) and a native pack (--native)\n");
+        return 2;
+    }
     if (!kvg_started) {   // the elastic K/V of a prompt that was not read in batches
         kvg_started = true;
         kvg_start(xcache.slots());
@@ -16401,6 +17089,7 @@ int main(int argc, char** argv) {
     const double decode_ms = decoded > 0 ? total_ms / (double) decoded : 0.0;
     std::printf("%-24s %lld tokens in %.1f ms  ->  %.2f tok/s\n", "decode", (long long) decoded, total_ms,
                 decode_ms > 0.0 ? 1000.0 / decode_ms : 0.0);
+    if (!expert_whitelist_finish(decoded, total_ms / 1000.0)) return 1;   // --expert-whitelist
     if (n_prompt > 1)
         std::printf("%-24s %lld tokens in %.1f ms  ->  %.2f tok/s  (time to first token %.1f ms)\n", "prefill",
                     (long long) (n_prompt - 1), prefill_ms,

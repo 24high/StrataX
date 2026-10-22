@@ -225,7 +225,9 @@ endif()
 
 # --- the GPU engine ------------------------------------------------------------------------------------------------
 strata_resolve(_core src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp
-                     src/core/weights.cpp src/core/layout.cpp)
+                     src/core/weights.cpp src/core/layout.cpp
+                     src/core/expert_whitelist.cpp src/core/routing_stats.cpp src/core/layerwise_calib.cpp
+                     src/core/expert_similarity.cpp)
 add_library(strata_core STATIC ${_core})
 target_link_libraries(strata_core PUBLIC strata_includes)
 # zeMemAllocHost for the host memory a kernel polls (include/strata/sycl_queue.hpp, host_malloc_polled): only when libze-dev's header is there
@@ -245,6 +247,7 @@ foreach(k IN LISTS _kernel_cu)
 endforeach()
 strata_resolve(_kernels ${_kernel_files} src/kernels/ngram.cpp src/ngram/ple_reader.cpp src/platform/direct_file.cpp)
 list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp)   # port-only: the XMX prompt attention
+list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/expert_whitelist_stub.cpp)   # --expert-whitelist: refused here
 add_library(strata_kernels STATIC ${_kernels})
 target_include_directories(strata_kernels PRIVATE ${STRATA_ROOT}/third_party/ggml)
 target_link_libraries(strata_kernels PUBLIC strata_core)

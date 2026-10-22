@@ -1048,4 +1048,45 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     ms_repark_ += std::chrono::duration<double, std::milli>(t_d - t_c).count();
 }
 
+bool all_expert_outputs(ExpertPool& pool, const NativeFmt* fmt, int64_t n_expert,
+                        const std::function<const uint8_t*(int64_t expert)>& blob, const float* x, int64_t n, float* y,
+                        std::string& err) {
+    // the activations of up to MAXT rows, quantized as expert_pool_dispatch_multi quantizes a token's: a native Q2_0
+    // layer's for its Q2_0 kernels, another native layer's for its vec_dot type, the canonical pack's Q8_1
+    const bool q2 = fmt != nullptr && q2_native_kernels(fmt->gu_type);
+    std::vector<ActQ> act((size_t) MAXT);
+    std::vector<uint8_t> nact((size_t) MAXT * kNativeActBytes);
+    std::vector<ExpertJobMulti> jobs;
+    for (int64_t t0 = 0; t0 < n; t0 += MAXT) {
+        const int nt = (int) std::min<int64_t>(MAXT, n - t0);
+        for (int t = 0; t < nt; ++t) {
+            const float* xr = x + (size_t) (t0 + t) * (size_t) H;
+            if (q2) act_quant_any(xr, H, act[(size_t) t]);
+            else if (fmt != nullptr) native_quant_act(*fmt, xr, nact.data() + (size_t) t * kNativeActBytes);
+            else act_quant_q8_1(xr, H, act[(size_t) t]);
+        }
+        for (int64_t e0 = 0; e0 < n_expert; e0 += ExpertPool::kMaxSplitMulti) {
+            const int ne = (int) std::min<int64_t>(ExpertPool::kMaxSplitMulti, n_expert - e0);
+            jobs.assign((size_t) ne, ExpertJobMulti{});
+            for (int j = 0; j < ne; ++j) {
+                ExpertJobMulti& jb = jobs[(size_t) j];
+                jb.blob = blob(e0 + j);
+                if (jb.blob == nullptr) {
+                    err = "expert " + std::to_string(e0 + j) + " has no blob";
+                    return false;
+                }
+                jb.nt = nt;
+                for (int t = 0; t < nt; ++t) {
+                    jb.act[t] = &act[(size_t) t];
+                    jb.nact[t] = nact.data() + (size_t) t * kNativeActBytes;
+                    jb.out[t] = y + ((size_t) (t0 + t) * (size_t) n_expert + (size_t) (e0 + j)) * (size_t) H;
+                }
+            }
+            if (fmt != nullptr) pool.run_split_multi_native(*fmt, jobs.data(), ne);
+            else pool.run_split_multi(jobs.data(), ne);
+        }
+    }
+    return true;
+}
+
 }  // namespace strata::kernels::cpu

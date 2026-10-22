@@ -9,6 +9,8 @@
 #include "mmq_resident_sort.hpp"
 #include "wmma_gemm.h"
 #include "strata/core/mtp.hpp"
+#include "strata/core/expert_whitelist.hpp"
+#include "strata/kernels/expert_whitelist.hpp"
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/on_device.hpp"
@@ -909,6 +911,10 @@ struct Prefill::Impl {
     std::vector<int32_t> bounds_host;
     std::unique_ptr<mmq::Context> mmq_ctx;
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
+    std::vector<int32_t> rs_ids;   // on_routing: a layer's final routing on the host (only while a collector listens)
+    std::vector<float> rs_w;
+    std::vector<int32_t> rs_rows;   // moe_rows_wanted: the chunk's rows whose expert input the collector wants
+    std::vector<float> rs_x;        // ...their expert input on the host
     // set_cpu_pool: a small chunk's CPU experts. The layer's MoE input (T x N, from `mixed`), the rows the pool writes
     // (Dm's tail, in Dm's row order), ones for row_sd (the CPU's rows carry s_down already), all pinned; and the
     // pool's per-token activations and jobs.
@@ -2861,7 +2867,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
-        const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
+        // --expert-whitelist: the walk streams only experts the whitelist lets be loaded; in tiered mode the on_demand tier
+        // must not be read unless it is routed, so a chunk takes the routed-only path instead of the walk
+        const core::ExpertWhitelist* const wl = core::active_expert_whitelist();
+        const bool wl_tiered = wl != nullptr && wl->mode == core::WhitelistMode::Tiered && wl->total(core::kWlOnDemand) > 0;
+        // ...and with an on_demand cache, the source copies an on_demand expert out of it (copy_blob, the entry held only
+        // while it is copied): no pointer into the cache is handed to the stager or the CPU share
+        const bool od_cached = wl_tiered && core::whitelist_on_demand_cached(m.src);
+        auto od_copied = [&](int64_t l, int64_t e) { return od_cached && wl->on_demand(l, e); };
+        const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr && !wl_tiered;
         // the CPU share: this chunk takes the pool if no other stage of a layer split has it now (released at the end
         // of the chunk, after the last layer's CPU thread is joined)
         struct PoolHold {
@@ -2917,6 +2931,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
+                    if (wl != nullptr && !wl->loadable(l, e)) continue;          // blocked: never routed, never read
                     int job = -1;
                     const uint8_t* b = nullptr;
                     if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
@@ -3479,6 +3494,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
+                    // --expert-whitelist: the mask before the top-k (its fix follows the debug hook below)
+                    strata::kernels::whitelist_route_mask(strata::kernels::kWlMain, l, m.logits, (int) T, (int) m.g->n_expert, m.cs);
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
                     // RESEARCH HOOK (141-research, opt-in, never on by default): STRATA_DBG_FEAT=<file> dumps, per MoE layer and chunk,
                     // the routed ids + weights (and for the layers in STRATA_DBG_FEAT_LAYERS the router-input hidden state, bf16);
@@ -3537,6 +3554,41 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (it != ovr.end() && (int64_t) it->second.ids.size() == T * K) {
                                 cudaMemcpy(m.ids, it->second.ids.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice);
                                 cudaMemcpy(m.w, it->second.w.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice);
+                            }
+                        }
+                    }
+                    // --expert-whitelist: after the last writer of the ids (the router, the debug override), before any reader
+                    strata::kernels::whitelist_route_fix(strata::kernels::kWlMain, l, m.logits, m.ids, m.w, (int) T, (int) K,
+                                                         (int) m.g->n_expert, m.cs);
+                    // --routing-stats (opt-in): the final routing of this layer and chunk to the collector
+                    if (on_routing) {
+                        m.rs_ids.resize((size_t) (T * K));
+                        m.rs_w.resize((size_t) (T * K));
+                        if (cudaMemcpyAsync(m.rs_ids.data(), m.ids, (size_t) (T * K) * 4, cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+                            cudaMemcpyAsync(m.rs_w.data(), m.w, (size_t) (T * K) * 4, cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+                            cudaStreamSynchronize(cs) != cudaSuccess) {
+                            err = std::string("prefill: the routing statistics' download: ") + cudaGetErrorString(cudaGetLastError());
+                            return false;
+                        }
+                        on_routing(l, p0, T, m.rs_ids.data(), m.rs_w.data());
+                        // --routing-stats-similarity (opt-in): the expert input (m.mixed, what the experts read) of the rows
+                        // the collector samples, row by row; nothing when none is wanted
+                        if (moe_rows_wanted && on_moe_rows) {
+                            m.rs_rows.clear();
+                            moe_rows_wanted(l, p0, T, m.rs_rows);
+                            if (!m.rs_rows.empty()) {
+                                m.rs_x.resize(m.rs_rows.size() * (size_t) N);
+                                bool dl = true;
+                                for (size_t i = 0; i < m.rs_rows.size() && dl; ++i)
+                                    dl = m.rs_rows[i] >= 0 && m.rs_rows[i] < T &&
+                                         cudaMemcpyAsync(m.rs_x.data() + i * (size_t) N, m.mixed + (size_t) m.rs_rows[i] * (size_t) N,
+                                                         (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, cs) == cudaSuccess;
+                                if (!dl || cudaStreamSynchronize(cs) != cudaSuccess) {
+                                    err = std::string("prefill: the similarity data's expert input download: ") +
+                                          cudaGetErrorString(cudaGetLastError());
+                                    return false;
+                                }
+                                on_moe_rows(l, p0, m.rs_rows.data(), (int64_t) m.rs_rows.size(), m.rs_x.data());
                             }
                         }
                     }
@@ -3798,6 +3850,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                             ++m.cnt[(size_t) e];
                         }
+                        // --expert-whitelist: a routed id outside it is a hard error, never a load
+                        if (!core::whitelist_check_ids(l, ids_h, T * K, "the prompt path")) { err = core::whitelist_violation(); return false; }
+                        if (core::whitelist_stats() != nullptr) core::whitelist_count_on_demand(m.src, l, ids_h, T * K, true);
                         if (cpu_maybe) {
                             std::vector<std::pair<int32_t, int32_t>> cand;   // (tokens, expert)
                             int64_t nstream = 0;
@@ -3808,7 +3863,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 ++nstream;
                                 // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
                                 // short-lived buffer (the arena's unpinned part, the mapped experts.bin's pages)
-                                if (c <= strata::kernels::cpu::MAXT && (m.src->pinned(l, e) || !m.src->transient(l, e)))
+                                if (c <= strata::kernels::cpu::MAXT && (m.src->pinned(l, e) || !m.src->transient(l, e)) &&
+                                    !od_copied(l, e))
                                     cand.emplace_back(c, e);
                             }
                             std::sort(cand.begin(), cand.end());
@@ -4381,7 +4437,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
-                                if (m.src->transient(l, e)) {   // CS-T: copied by the source
+                                if (m.src->transient(l, e) || od_copied(l, e)) {   // CS-T: copied by the source
                                     js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
                                     continue;
                                 }
@@ -4836,6 +4892,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
+        if (rows_out_ != nullptr) {   // run_layer: the layer's output rows to the caller; no head, no on_chunk
+            if (cudaMemcpyAsync(rows_out_ + (size_t) c0 * D, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
+                cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                err = std::string("prefill: a layer's output rows: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            continue;
+        }
         if (next_ != nullptr) {
             // The current hand-off slot was used two chunks ago.
             float* h = m.hand[hand_buf_];
@@ -5066,6 +5130,47 @@ bool Prefill::reserve_uploads(int64_t T) {
     }
     if (next_ != nullptr) ok = next_->reserve_uploads(T) && ok;
     return ok;
+}
+
+bool Prefill::run_layer(int64_t layer, const int64_t* tokens, int64_t n, const float* rows_in, float* rows_out,
+                        std::string& err) {
+#if defined(STRATA_GPU_METAL)
+    (void) layer, (void) tokens, (void) n, (void) rows_in, (void) rows_out;
+    err = "prefill: the layer-wise calibration is not wired to the Metal engine";
+    return false;
+#else
+    if (!impl_ || impl_->g == nullptr) { err = "prefill: run_layer before init"; return false; }
+    if (next_ != nullptr || helper_ != nullptr || stage_lb_ != 0 || stage_le_ != impl_->g->n_layers || impl_->pp != nullptr) {
+        err = "prefill: the layer-wise calibration runs on one GPU without a layer split, a stage helper or a peer GPU";
+        return false;
+    }
+    if (layer < 0 || layer >= impl_->g->n_layers || n <= 0 || rows_out == nullptr || (layer > 0) != (rows_in != nullptr)) {
+        err = "prefill: run_layer: a layer out of range, no rows, or input rows for layer 0 (it embeds the tokens)";
+        return false;
+    }
+    // the stage machinery with a one-layer range: a later stage reads its rows from hand_in_, the output goes to rows_out_
+    struct Restore {
+        Prefill& p;
+        int64_t lb, le;
+        ~Restore() {
+            p.stage_lb_ = lb;
+            p.stage_le_ = le;
+            p.hand_in_ = nullptr;
+            p.rows_out_ = nullptr;
+            p.single_chunk_ = false;
+            p.pipe_chunked_ = false;
+        }
+    } restore{*this, stage_lb_, stage_le_};
+    stage_lb_ = layer;
+    stage_le_ = layer + 1;
+    hand_in_ = rows_in;
+    hand_ev_ = nullptr;
+    hand_pieces_ = 0;
+    rows_out_ = rows_out;
+    single_chunk_ = n <= chunk();
+    pipe_chunked_ = false;
+    return run_impl(tokens, n, 0, err);
+#endif
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
