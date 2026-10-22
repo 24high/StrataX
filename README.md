@@ -21,6 +21,271 @@
 <sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
 <a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
 
+## New: expert whitelists (experimental)
+
+This version of Strata can run the model with **only the experts your work needs**. You make a list of them once,
+from examples of your own kind of work, and the engine then leaves all other experts out. That saves memory. The
+feature is opt-in: without the new options nothing changes.
+
+**On this page:** [what it is](#what-is-an-expert-whitelist) · [what is new](#what-is-new) ·
+[status](#status-what-works-and-what-is-not-measured-yet) · [first results](#first-results-one-run) ·
+[step by step](#step-by-step-make-and-use-a-whitelist) · [problems](#when-something-goes-wrong-with-a-whitelist) ·
+all details in [docs/EXPERT_WHITELIST.md](docs/EXPERT_WHITELIST.md)
+
+### What is an expert whitelist?
+
+The model Strata runs is a *mixture of experts*. Each of its 48 layers has 512 small sub-networks, the **experts**.
+For every piece of a word (a *token*) a small **router** picks the 10 experts that fit best. Only those 10 compute,
+which is why such a big model can run on a PC at all. But over a long conversation nearly every expert is picked at
+some point, so all of them must be at hand: about 47 GB for the IQ3_S model, in RAM and graphics memory.
+
+Not every task needs every expert. A model that only writes Python may not need the experts the router picks for
+poems, for French or for Java. An **expert whitelist** is a list of the experts the engine may use. The engine then:
+
+- never picks an expert that is not on the list, and
+- never loads it into RAM or graphics memory.
+
+Nothing is trained and no weight is changed. The model only chooses from fewer experts.
+
+**What you can gain:** less memory for the experts, so more of the ones you need fit into graphics memory or RAM.
+**What it costs:** answers outside the whitelist's topic get worse, maybe much worse. Answers on the topic can
+change a little. How much is measured with `eval` (step 9 below), not guessed.
+
+The list is not written by hand. A **generator** (`tools/whitelist_gen.py`) runs your example conversations through
+the model, counts which experts the router picks for which language and task, and keeps the experts that carry your
+work.
+
+What happens when the router would like an expert that is not on the list depends on the **mode**:
+
+| Mode | What happens to an expert that is not on the list | Good for |
+|---|---|---|
+| `strict` (default) | It is never used; the router chooses among the allowed experts. | The smallest memory, the largest quality risk. |
+| `tiered` | A second list (`on_demand`) is read from the drive only when the router picks one, and kept in a small RAM cache. | Less memory with quality close to the full model. Rare experts cost a drive read. |
+| `substitute` | A similar allowed expert takes over (similarity measured during the collection). | Experiments; needs `collect --similarity`. |
+
+### What is new
+
+- **The engine** (`strata`) reads a whitelist: `--expert-whitelist FILE`, `--expert-whitelist-mode
+  strict|substitute|tiered`, `--draft-expert-whitelist` (the MTP draft layer), `--expert-whitelist-stats` (counters
+  at the end), `--expert-whitelist-cache-gib` (tiered: the RAM cache, default 1 GiB) and
+  `--expert-whitelist-substitute-threshold`. Every path keeps to it: decode, speculative checks, the prompt path, the
+  expert caches and the look-ahead.
+- **The engine records routing statistics** (`--routing-stats-*`): it reads prepared calibration samples and counts,
+  per layer, expert and category, how often and how strongly each expert was picked. Token mode, a layer-wise mode for
+  models larger than RAM and VRAM, and optional expert similarity data.
+- **The generator** `tools/whitelist_gen.py` with the stages `prepare`, `analyze`, `estimate`, `collect`, `merge`,
+  `build`, `inspect` and `eval`.
+- **A checker** `tools/expert_whitelist.py`: `check-profile`, `fingerprint` and `validate`.
+- **A ready Python profile** with data for a real run (`data/expert_whitelist/profiles/python-coding.json`): 650
+  example conversations (code, debugging, tests, data work, agent sessions with tool calls, German questions, plus
+  general abilities every model must keep) and the repository's own Python files.
+
+### Status: what works and what is not measured yet
+
+- **Experimental and opt-in.** The ready-made installers and engines do not contain it. Build the engine from this
+  source tree (step 1).
+- **Supported:** the Qwen3.8-Flash-Next family on NVIDIA cards (CUDA). The HIP (AMD) build has the code but was not
+  built or run. Mac (Metal), Intel (SYCL) and the Qwen3.6-35B-A3B engine refuse a whitelist at start.
+- **What has run:** the engine was built for an RTX 4080 (sm_89, CUDA 13.0), `collect` ran on the IQ3_S model, and
+  `build` made whitelists from it (next section).
+- **Not measured yet:** the quality of a whitelisted model (`eval`), its speed, and the `tiered` mode's drive reads on
+  a GPU. Until those numbers exist, treat every whitelist as an experiment.
+- **The Python data was written by an AI model (Claude) for this purpose.** It is not taken from real users. It
+  contains no thinking text, so the tokens the model writes while it thinks are not part of the calibration.
+
+### First results (one run)
+
+Measured on: Qwen3.8-Flash-Next IQ3_S, one RTX 4080 (16 GB), Linux, engine 0.1.46.1 built from this tree, the
+`python-coding` profile with a control vector active (the server's own configuration). `collect` read 872 samples,
+1,496,785 tokens, in token mode. The counts and sizes below are what `build` computed from that run. They are not
+speed or quality measurements.
+
+| Whitelist | Experts kept (resident) | Expert memory | Saved |
+|---|---|---|---|
+| none (full model) | 24,576 | 46.84 GiB | |
+| `strict`, Python 95 %, general abilities 90-99 % | 21,195 | 40.25 GiB | 6.6 GiB (14 %) |
+| `tiered`, Python 90 % resident, up to 99.5 % from the drive, general abilities 85-95 % | 18,108 | 34.33 GiB | 12.5 GiB (27 %) |
+
+**What this shows:** for Python work, this model spreads its routing over almost all experts. In most layers (at least 34 of 48) the
+spread is nearly even (normalised entropy 0.90 to 0.95, where 1.0 is perfectly even). So a whitelist that keeps
+95 % of the routing keeps most experts. Larger savings need lower coverage or the `tiered` mode, and only `eval` can
+say what that costs.
+
+### Step by step: make and use a whitelist
+
+You need:
+
+- a PC with an NVIDIA card that already runs Strata with a Qwen3.8-Flash-Next model (a pack and its GGUF files),
+- **the whole repository** on that PC (the generator uses `serve/`, `tools/` and `data/`),
+- Python 3.10 or newer with the packages `regex` and `jinja2` (`python3 -m pip install regex jinja2`, or on
+  Ubuntu `sudo apt install python3-regex python3-jinja2`),
+- for building the engine: the CUDA toolkit 13.0 or newer, CMake and Ninja, and a driver 580 or newer,
+- a few hundred MB of free disk for the samples and statistics, and time: the collection reads every sample once.
+
+Run every command from the repository's folder.
+
+**1. Build an engine with whitelist support.** The release engines do not have it. For an RTX 40 card (sm_89; RTX 30
+is 86, RTX 50 is 120, RTX 20 is 75):
+
+```bash
+git clone https://github.com/ggml-org/llama.cpp third_party/llama.cpp
+git -C third_party/llama.cpp checkout 3cf03257f219afbe7334045ff7c6a06ac68c627d
+cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
+      -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
+      -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp
+cmake --build build --target strata strata_kq
+```
+
+Check that it has the new options (the number must be above 0):
+
+```bash
+build/strata --help 2>&1 | grep -c expert-whitelist
+```
+
+**2. Write `engine.json`.** It tells the generator how to start the engine. Take the model's arguments from the start
+configuration Strata already uses. A `setup.py` install writes one per model, for example `strata-iq3_s.json`. This
+copies its arguments and points `"exe"` at the new engine:
+
+```bash
+python3 - <<'EOF'
+import json, pathlib
+eng = pathlib.Path("build").resolve()
+cfg = json.loads(pathlib.Path("strata-iq3_s.json").read_text())
+out = {"exe": str(eng / "strata"), "lib_dirs": [str(eng)], "args": cfg["args"], "cwd": cfg.get("cwd", ".")}
+if cfg.get("env"):
+    out["env"] = cfg["env"]
+pathlib.Path("engine.json").write_text(json.dumps(out, indent=1))
+print(json.dumps(out, indent=1))
+EOF
+```
+
+Without such a file, write it by hand. The important parts are `--pack` (the folder with `native_experts.txt`) and
+`--native` (the first GGUF file):
+
+```json
+{"exe": "/path/to/build/strata", "lib_dirs": ["/path/to/build"],
+ "args": ["--pack", "/path/to/packs/iq3_s", "--native", "/path/to/Qwen3.8-Flash-Next-...-00001-of-00002.gguf",
+          "--prefill", "auto"]}
+```
+
+Everything in `args` also applies to the collection: a control vector there shapes the statistics too. That is right
+when you always run the model with it.
+
+**3. Pick a profile.** A profile says which languages and tasks the whitelist is for. `python-coding.json` is ready
+for a real run. The Rust and TypeScript profiles use a tiny demonstration set: copy one and point it at your own data
+first (format in [docs/EXPERT_WHITELIST.md](docs/EXPERT_WHITELIST.md), section 2.1). Set `target_hardware` in the
+profile to your PC (graphics memory and RAM in GiB). Check it:
+
+```bash
+python3 tools/expert_whitelist.py check-profile data/expert_whitelist/profiles/python-coding.json
+```
+
+**4. Prepare the samples.** This turns the conversations into the model's tokens, with its own chat template. Nothing
+runs on the graphics card:
+
+```bash
+python3 tools/whitelist_gen.py prepare --profile data/expert_whitelist/profiles/python-coding.json --model engine.json --out prep/python
+```
+
+There must be no warning about the chat template. 10 % of the samples are held back for `eval`.
+
+**5. Check what the collection needs.** `estimate` loads no model. Give it your graphics memory and RAM, each minus a
+little room:
+
+```bash
+python3 tools/whitelist_gen.py estimate --model engine.json --prep prep/python --vram-budget 14G --ram-budget 56G --scratch /path/to/ssd/strata-tmp
+```
+
+For the models Strata runs, it should say `recommended: --mode token`.
+
+**6. Stop the running Strata server.** The collection starts its own engine, and two engines do not fit into memory
+together. Use `strata launch --stop`, or end the `serve/server.py` process (`kill <PID>`, not `-9`). Check that the
+graphics card is free (the output must be empty):
+
+```bash
+nvidia-smi --query-compute-apps=pid --format=csv,noheader
+```
+
+**7. Collect the statistics.** This is the long step: the engine reads every sample once. Start it so it keeps
+running when you close the terminal:
+
+```bash
+nohup python3 tools/whitelist_gen.py collect --model engine.json --prep prep/python --out stats/python-run1 --mode token > collect.log 2>&1 &
+```
+
+Every 64 samples it writes a checkpoint (`grep checkpoint collect.log`). If it stops, run the same command with
+`--resume`. When it is done, the log ends with `routing stats: ... samples ... in ... s`. You can start the Strata
+server again: the next steps do not need the graphics card, except `eval`.
+
+**8. Build the whitelist.** No graphics card needed; the statistics are reused, so try several versions. Add `--gguf`
+with your first GGUF file so the report can compute the memory.
+
+The plain version (`strict`, the coverages in the profile):
+
+```bash
+python3 tools/whitelist_gen.py build --stats stats/python-run1 --profile data/expert_whitelist/profiles/python-coding.json --mode coverage --gguf /path/to/model-00001-of-00002.gguf --out whitelists/python.json
+```
+
+A smaller version that stays closer to the full model (`tiered`: 90 % in memory, the rest up to 99.5 % read from the
+drive when needed):
+
+```bash
+python3 tools/whitelist_gen.py build --stats stats/python-run1 --profile data/expert_whitelist/profiles/python-coding.json --mode coverage --coverage 0.90 --whitelist-mode tiered --on-demand-coverage 0.995 --gguf /path/to/model-00001-of-00002.gguf --out whitelists/python-tiered.json
+```
+
+The first line of the output names the size, for example `21195 of 24576 experts, 40.25 GiB of 46.84 GiB`. Next to
+the whitelist, `build` writes a report (`.report.md`): the coverage per layer and per part of the profile, the memory
+before and after, and warnings. To compare several sizes at once, use `--sweep coverage=0.95,0.90,0.85,0.80` with
+`{value}` in `--out`. For a fixed size, use `--mode budget --budget 30G`. The general abilities (instructions, chat
+structure, tool calls, shell output) keep their own coverages from the profile; lower them in a copy of the profile
+to save more.
+
+**9. Measure the quality.** `eval` runs the held-back samples twice, with the full model and with the whitelist, and
+compares them per language, task and part of the conversation: how often the most likely next token stays the same,
+the KL divergence and the perplexity. Stop the Strata server first (step 6):
+
+```bash
+nohup python3 tools/whitelist_gen.py eval --model engine.json --whitelist whitelists/python-tiered.json --prep prep/python --out evals/python-tiered > eval.log 2>&1 &
+```
+
+A top-1 match close to 100 % and a KL close to 0 on the Python answers mean the whitelist hardly changes the model.
+If the Python part drops clearly, raise the coverage and build again.
+
+**10. Use it.** Check it against the model, then add it to the engine's arguments:
+
+```bash
+python3 tools/expert_whitelist.py validate whitelists/python-tiered.json --pack /path/to/packs/iq3_s --gguf /path/to/model-00001-of-00002.gguf
+```
+
+In the start configuration (for example `strata-iq3_s.json`), set `"exe"` to the engine from step 1 and add to
+`"args"`:
+
+```text
+"--expert-whitelist", "/path/to/whitelists/python-tiered.json"
+```
+
+Optional: `"--expert-whitelist-stats"` prints at the end, per layer, which experts were selected and run, and
+`"--expert-whitelist-cache-gib", "2"` gives the `tiered` mode a larger RAM cache. Start Strata as usual. To go back to
+the full model, remove these arguments.
+
+### When something goes wrong with a whitelist
+
+| Message | Cause | What to do |
+|---|---|---|
+| `prepare: warning: the model's chat template could not be rendered here (...)` | `jinja2` is missing for this Python, or `serve/frontend.py` is not there. The message names which. | Install `jinja2` for the Python you run, or copy the whole repository. Run `prepare` again. |
+| `the chat template does not render a conversation as a prefix of the longer one` | An older `tools/whitelist_gen.py` (parallel tool calls). | Update the repository. |
+| `prepare: warning: the python source glob ... matches no file` | The profile reads Python files from folders that are not on this PC. | Harmless (they are only example text), or copy those folders, or add your own code under `"sources"`. |
+| `neither native_experts.txt nor manifest.json: not a Strata pack` | `--pack` in `engine.json` points at the wrong folder. | Find the pack: `find / -name native_experts.txt 2>/dev/null`. |
+| `estimate` reports about 31 GiB of non-expert weights and recommends `layerwise` | An older `tools/whitelist_gen.py` counted the PLE table, which the engine reads from the drive. | Update the repository; it should then report about 4 GiB and recommend `token`. |
+| The collection stops or the PC runs out of memory | The Strata server is still running next to the collection. | Stop it first (step 6). |
+| Many warnings `the profile's routing is nearly flat` | A property of the model: it uses almost all experts for this work. | Expected. A whitelist saves less there; try `tiered`, a lower coverage or a budget, then check with `eval`. |
+| The engine does not know `--routing-stats-out` or `--expert-whitelist` | `engine.json` or the start configuration points at a release engine. | Use the engine from step 1. |
+
+Everything else (the formats, how each mode routes, the generator's scoring, all options and the open points) is in
+**[docs/EXPERT_WHITELIST.md](docs/EXPERT_WHITELIST.md)**.
+
+---
+
 Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**, a 125-billion-parameter model that
 normally needs a server, on a normal PC. It chats, writes code, reads pictures and works with your apps and coding
 agents. Your chats and files stay on your PC.
